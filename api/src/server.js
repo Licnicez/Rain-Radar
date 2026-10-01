@@ -12,10 +12,10 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Rain Radar API is running!' });
 });
 
-// Endpoint เช็กฝนเส้นทาง
+// Endpoint เช็กฝนเส้นทาง รองรับเวลาออกเดินทางล่วงหน้า
 app.post('/api/analyze-route', async (req, res) => {
   try {
-    const { origin, destination, sampleIntervalKm } = req.body;
+    const { origin, destination, sampleIntervalKm, departureOffsetMin } = req.body;
 
     if (!origin?.lat || !origin?.lon || !destination?.lat || !destination?.lon) {
       return res.status(400).json({
@@ -28,6 +28,7 @@ app.post('/api/analyze-route', async (req, res) => {
       origin,
       destination,
       sampleIntervalKm: sampleIntervalKm || 4,
+      departureOffsetMin: Number(departureOffsetMin) || 0,
     });
 
     res.json({ status: 'success', data: result });

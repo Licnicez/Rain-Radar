@@ -18,3 +18,14 @@ const app = (
 
 // https://bun.com/docs/bundler/hot-reloading#import-meta-hot-data
 (import.meta.hot.data.root ??= createRoot(elem)).render(app);
+
+// Register PWA Service Worker
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((reg) => console.log("PWA Service Worker registered with scope:", reg.scope))
+      .catch((err) => console.warn("PWA Service Worker registration failed:", err));
+  });
+}
+

@@ -37,9 +37,9 @@ function sampleRoutePoints(coordinates, intervalKm = 4) {
   return sampled;
 }
 
-// ดึงสภาพอากาศแบบ Batch (ส่งหลายพิกัดใน 1 คำขอ เพื่อป้องกัน HTTP 429 Too Many Requests)
-async function fetchBatchWeather(checkpoints, currentHour) {
-  const batchSize = 30; // Open-Meteo รองรับ comma-separated coordinates ได้สูงสุดถึง 100 จุด
+// ดึงสภาพอากาศแบบ Batch (ส่งหลายพิกัดใน 1 คำขอ พร้อมรองรับเวลาออกเดินทางล่วงหน้า)
+async function fetchBatchWeather(checkpoints, departureDate, totalDurationMin) {
+  const batchSize = 30;
   const allResults = [];
 
   for (let i = 0; i < checkpoints.length; i += batchSize) {
@@ -47,9 +47,9 @@ async function fetchBatchWeather(checkpoints, currentHour) {
     const lats = chunk.map((pt) => pt.lat.toFixed(4)).join(',');
     const lons = chunk.map((pt) => pt.lon.toFixed(4)).join(',');
 
-    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=1&timezone=auto`;
+    // forecast_days=2 เพื่อรองรับกรณีเดินทางข้ามวันหรือชั่วโมงล่วงหน้า
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=2&timezone=auto`;
 
-    // เพิ่ม retry เล็กน้อยหากติด network หรือ 429
     let weatherRes;
     let attempts = 0;
     while (attempts < 2) {
@@ -66,11 +66,31 @@ async function fetchBatchWeather(checkpoints, currentHour) {
     const weatherList = Array.isArray(weatherRes.data) ? weatherRes.data : [weatherRes.data];
 
     chunk.forEach((pt, index) => {
+      const globalIndex = i + index;
       const wData = weatherList[index] || weatherList[0];
       const hourly = wData?.hourly || {};
+      const timeArray = hourly.time || [];
 
-      const rainProb = hourly.precipitation_probability ? hourly.precipitation_probability[currentHour] ?? 0 : 0;
-      const rainAmount = hourly.rain ? hourly.rain[currentHour] ?? 0 : 0;
+      // คำนวณเวลาที่คาดว่าจะเดินทางไปถึงจุดตรวจนี้ (ETA at Checkpoint)
+      const progressRatio = checkpoints.length > 1 ? globalIndex / (checkpoints.length - 1) : 0;
+      const etaMinutes = progressRatio * totalDurationMin;
+      const etaDate = new Date(departureDate.getTime() + etaMinutes * 60 * 1000);
+
+      // แปลงเป็นฟอร์แมต ISO ชั่วโมงของ Open-Meteo เช่น "2026-10-01T21:00"
+      const yr = etaDate.getFullYear();
+      const mo = String(etaDate.getMonth() + 1).padStart(2, '0');
+      const da = String(etaDate.getDate()).padStart(2, '0');
+      const hr = String(etaDate.getHours()).padStart(2, '0');
+      const matchHourStr = `${yr}-${mo}-${da}T${hr}:00`;
+
+      // หา Index ของชั่วโมงนั้น
+      let targetHourIdx = timeArray.indexOf(matchHourStr);
+      if (targetHourIdx === -1) {
+        targetHourIdx = Math.min(etaDate.getHours(), timeArray.length - 1);
+      }
+
+      const rainProb = hourly.precipitation_probability ? hourly.precipitation_probability[targetHourIdx] ?? 0 : 0;
+      const rainAmount = hourly.rain ? hourly.rain[targetHourIdx] ?? 0 : 0;
 
       let status = 'SAFE';
       if (rainProb >= 50 || rainAmount >= 1.0) {
@@ -79,10 +99,13 @@ async function fetchBatchWeather(checkpoints, currentHour) {
         status = 'WARNING';
       }
 
+      const etaFormatted = `${String(etaDate.getHours()).padStart(2, '0')}:${String(etaDate.getMinutes()).padStart(2, '0')}`;
+
       allResults.push({
-        id: allResults.length + 1,
+        id: globalIndex + 1,
         lat: pt.lat,
         lon: pt.lon,
+        etaTime: etaFormatted,
         rainProbability: rainProb,
         rainAmountMm: rainAmount,
         status,
@@ -97,7 +120,7 @@ async function fetchBatchWeather(checkpoints, currentHour) {
   return allResults;
 }
 
-export async function analyzeRouteWeather({ origin, destination, sampleIntervalKm = 4 }) {
+export async function analyzeRouteWeather({ origin, destination, sampleIntervalKm = 4, departureOffsetMin = 0 }) {
   // 1. ดึงเส้นทางจาก OSRM
   const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=full&geometries=geojson`;
   const routeRes = await axios.get(osrmUrl, { timeout: 8000 });
@@ -109,31 +132,37 @@ export async function analyzeRouteWeather({ origin, destination, sampleIntervalK
 
   const coordinates = route.geometry.coordinates.map(([lon, lat]) => ({ lat, lon }));
   const checkpoints = sampleRoutePoints(coordinates, sampleIntervalKm);
+  const totalDurationMin = Math.round(route.duration / 60);
 
-  // 2. ดึงสภาพอากาศจาก Open-Meteo แบบ Batch (คำขอเดียวรวมทุกจุด ป้องกัน HTTP 429)
-  const currentHour = new Date().getHours();
-  const checkpointResults = await fetchBatchWeather(checkpoints, currentHour);
+  // 2. คำนวณเวลาออกเดินทางจริง (Target Departure Time)
+  const departureDate = new Date(Date.now() + departureOffsetMin * 60 * 1000);
+  const departureTimeFormatted = `${String(departureDate.getHours()).padStart(2, '0')}:${String(departureDate.getMinutes()).padStart(2, '0')}`;
 
-  // 3. สรุปภาพรวม
+  // 3. ดึงสภาพอากาศจาก Open-Meteo ตามชั่วโมงที่เดินทางจริง
+  const checkpointResults = await fetchBatchWeather(checkpoints, departureDate, totalDurationMin);
+
+  // 4. สรุปภาพรวม
   const rainPoints = checkpointResults.filter((p) => p.status !== 'SAFE');
   const maxProb = Math.max(...checkpointResults.map((p) => p.rainProbability), 0);
 
   let overallStatus = 'SAFE';
-  let recommendation = 'ถนนแห้ง ปลอดภัยตลอดสาย ขี่กลับได้สบายครับ';
+  let recommendation = `ออกเดินทางเวลา ${departureTimeFormatted} น. ถนนแห้ง ปลอดภัยตลอดสาย ขี่กลับได้สบายครับ`;
 
   if (checkpointResults.some((p) => p.status === 'DANGER')) {
     overallStatus = 'DANGER';
-    recommendation = 'เสี่ยงฝนตกหนักหรือมีฝนตามเส้นทาง แนะนำเตรียมชุดกันฝนหรือรอดูก่อนออกรถ';
+    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีจุดเสี่ยงฝนตกหนักตามเส้นทาง แนะนำเลื่อนเวลาเดินทางหรือเตรียมชุดกันฝน`;
   } else if (rainPoints.length > 0) {
     overallStatus = 'WARNING';
-    recommendation = 'มีโอกาสเจอละอองฝนบางช่วง ขี่ด้วยความระมัดระวังถนนลื่น';
+    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีโอกาสเจอละอองฝนบางช่วง ขี่ด้วยความระมัดระวังถนนลื่น`;
   }
 
   return {
     summary: {
       status: overallStatus,
+      departureTime: departureTimeFormatted,
+      departureOffsetMin,
       totalDistanceKm: (route.distance / 1000).toFixed(1),
-      totalDurationMin: Math.round(route.duration / 60),
+      totalDurationMin,
       totalCheckpoints: checkpointResults.length,
       rainPointsCount: rainPoints.length,
       maxRainProbability: maxProb,
