@@ -429,7 +429,7 @@ export function App() {
   const handleCheckRain = async () => {
     setLoading(true);
     try {
-      const res = await fetch('http://localhost:5000/api/analyze-route', {
+      const res = await fetch('https://rain-radar.onrender.com/api/analyze-route', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -449,7 +449,7 @@ export function App() {
         alert('API Error: ' + json.message);
       }
     } catch (err: any) {
-      alert('เชื่อมต่อ API พอร์ต 5000 ไม่ได้ (ตรวจสอบว่ารัน server.js ไว้หรือยัง): ' + err.message);
+      alert('เชื่อมต่อ API (https://rain-radar.onrender.com) ไม่ได้: ' + err.message);
     } finally {
       setLoading(false);
     }

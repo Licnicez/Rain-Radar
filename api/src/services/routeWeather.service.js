@@ -54,7 +54,10 @@ async function fetchBatchWeather(checkpoints, departureDate, totalDurationMin) {
     let attempts = 0;
     while (attempts < 2) {
       try {
-        weatherRes = await axios.get(weatherUrl, { timeout: 8000 });
+        weatherRes = await axios.get(weatherUrl, {
+          timeout: 8000,
+          headers: { 'User-Agent': 'MotoRainRadar/1.0 (https://rain-radar.onrender.com)' },
+        });
         break;
       } catch (err) {
         attempts++;
