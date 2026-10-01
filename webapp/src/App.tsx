@@ -861,9 +861,11 @@ export function App() {
           <>
             <div
               style={{
-                flex: 1,
+                flex: '1 1 0%',
+                minHeight: 0,
                 padding: isMobile ? '12px 18px 20px 18px' : '0',
                 overflowY: 'auto',
+                WebkitOverflowScrolling: 'touch',
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '14px',
@@ -1347,6 +1349,32 @@ export function App() {
               )}
             </div>
 
+            {/* ปุ่มกดสแกนเส้นทาง หลักในแบบฟอร์ม (มองเห็นทันทีหลังเลือกสถานที่และเวลา) */}
+            <button
+              onClick={handleCheckRain}
+              disabled={loading}
+              style={{
+                width: '100%',
+                minHeight: '50px',
+                padding: '12px',
+                backgroundColor: loading ? '#93c5fd' : '#2563eb',
+                color: 'white',
+                border: 'none',
+                borderRadius: '14px',
+                cursor: loading ? 'not-allowed' : 'pointer',
+                fontWeight: 800,
+                fontSize: '1.02rem',
+                boxShadow: '0 4px 14px rgba(37,99,235,0.3)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+                flexShrink: 0,
+              }}
+            >
+              {loading ? '⏳ กำลังคำนวณและสแกนเรดาร์...' : `⚡ สแกนสภาพอากาศเส้นทาง (${getDepartureTimeLabel(departureOffsetMin)})`}
+            </button>
+
             {/* สรุปผลการวิเคราะห์สภาพอากาศตลอดเส้นทาง */}
             {data && (
               <div
@@ -1399,43 +1427,6 @@ export function App() {
                 </div>
               </div>
             )}
-          </div>
-
-          {/* Sticky Action Footer: ปุ่มสแกนเส้นทาง ลอยอยู่ด้านล่างตลอดเวลา มองเห็นได้ทันที */}
-          <div
-            style={{
-              position: 'sticky',
-              bottom: 0,
-              backgroundColor: '#ffffff',
-              padding: '12px 18px max(14px, env(safe-area-inset-bottom)) 18px',
-              borderTop: '1px solid #f1f5f9',
-              boxShadow: '0 -4px 16px rgba(0,0,0,0.06)',
-              zIndex: 50,
-            }}
-          >
-            <button
-              onClick={handleCheckRain}
-              disabled={loading}
-              style={{
-                width: '100%',
-                minHeight: '48px',
-                padding: '12px',
-                backgroundColor: loading ? '#93c5fd' : '#2563eb',
-                color: 'white',
-                border: 'none',
-                borderRadius: '14px',
-                cursor: loading ? 'not-allowed' : 'pointer',
-                fontWeight: 800,
-                fontSize: '1.02rem',
-                boxShadow: '0 4px 14px rgba(37,99,235,0.3)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-              }}
-            >
-              {loading ? '⏳ กำลังคำนวณและสแกนเรดาร์...' : `⚡ สแกนสภาพอากาศเส้นทาง (${getDepartureTimeLabel(departureOffsetMin)})`}
-            </button>
           </div>
         </>
       )}
