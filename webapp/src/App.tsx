@@ -49,6 +49,177 @@ function calculateBearing(lat1: number, lon1: number, lat2: number, lon2: number
   return (brng + 360) % 360;
 }
 
+// คำนวณระยะห่างระหว่างจุด (Haversine formula - กิโลเมตร)
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// ซอยจุดพิกัดตามระยะห่าง (km)
+function sampleRoutePoints(coordinates: { lat: number; lon: number }[], intervalKm = 4) {
+  if (!coordinates || coordinates.length === 0) return [];
+  const sampled = [coordinates[0]];
+  let lastPoint = coordinates[0];
+
+  for (let i = 1; i < coordinates.length; i++) {
+    const currentPoint = coordinates[i];
+    const dist = calculateDistance(lastPoint.lat, lastPoint.lon, currentPoint.lat, currentPoint.lon);
+    if (dist >= intervalKm) {
+      sampled.push(currentPoint);
+      lastPoint = currentPoint;
+    }
+  }
+
+  const lastTarget = coordinates[coordinates.length - 1];
+  if (sampled[sampled.length - 1] !== lastTarget) {
+    sampled.push(lastTarget);
+  }
+  return sampled;
+}
+
+// วิเคราะห์เส้นทางและสภาพอากาศโดยตรงบนเบราว์เซอร์ผู้ใช้ (Client-Side Fallback)
+// ช่วยป้องกันปัญหา Render Free Tier ติด Rate Limit 429 หรือ Cold Start หลับ
+async function analyzeRouteClientSide(
+  origin: { lat: number; lon: number },
+  destination: { lat: number; lon: number },
+  sampleIntervalKm = 4,
+  departureOffsetMin = 0
+): Promise<RouteAnalysis> {
+  // 1. ดึงเส้นทางจาก OSRM
+  const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=full&geometries=geojson`;
+  const routeRes = await fetch(osrmUrl);
+  if (!routeRes.ok) {
+    throw new Error('ไม่สามารถค้นหาเส้นทางจากเซิร์ฟเวอร์นำทางได้');
+  }
+  const routeJson = await routeRes.json();
+  const route = routeJson?.routes?.[0];
+  if (!route) {
+    throw new Error('ไม่พบข้อมูลเส้นทางระหว่างจุดสองจุดนี้');
+  }
+
+  const coordinates: { lat: number; lon: number }[] = route.geometry.coordinates.map(
+    ([lon, lat]: [number, number]) => ({ lat, lon })
+  );
+  const checkpoints = sampleRoutePoints(coordinates, sampleIntervalKm);
+  const totalDurationMin = Math.round(route.duration / 60);
+
+  // 2. คำนวณเวลาออกเดินทางจริง
+  const departureDate = new Date(Date.now() + departureOffsetMin * 60 * 1000);
+  const departureTimeFormatted = `${String(departureDate.getHours()).padStart(2, '0')}:${String(
+    departureDate.getMinutes()
+  ).padStart(2, '0')}`;
+
+  // 3. ดึงสภาพอากาศจาก Open-Meteo แบบ Batch
+  const batchSize = 30;
+  const allResults: Checkpoint[] = [];
+
+  for (let i = 0; i < checkpoints.length; i += batchSize) {
+    const chunk = checkpoints.slice(i, i + batchSize);
+    const lats = chunk.map((pt) => pt.lat.toFixed(4)).join(',');
+    const lons = chunk.map((pt) => pt.lon.toFixed(4)).join(',');
+
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=2&timezone=auto`;
+    const weatherRes = await fetch(weatherUrl);
+    if (!weatherRes.ok) {
+      throw new Error('ไม่สามารถดึงข้อมูลพยากรณ์อากาศจาก Open-Meteo ได้');
+    }
+    const weatherData = await weatherRes.json();
+    const weatherList = Array.isArray(weatherData) ? weatherData : [weatherData];
+
+    chunk.forEach((pt, index) => {
+      const globalIndex = i + index;
+      const wData = weatherList[index] || weatherList[0];
+      const hourly = wData?.hourly || {};
+      const timeArray: string[] = hourly.time || [];
+
+      // คำนวณเวลาที่คาดว่าจะเดินทางไปถึงจุดตรวจนี้ (ETA)
+      const progressRatio = checkpoints.length > 1 ? globalIndex / (checkpoints.length - 1) : 0;
+      const etaMinutes = progressRatio * totalDurationMin;
+      const etaDate = new Date(departureDate.getTime() + etaMinutes * 60 * 1000);
+
+      const yr = etaDate.getFullYear();
+      const mo = String(etaDate.getMonth() + 1).padStart(2, '0');
+      const da = String(etaDate.getDate()).padStart(2, '0');
+      const hr = String(etaDate.getHours()).padStart(2, '0');
+      const matchHourStr = `${yr}-${mo}-${da}T${hr}:00`;
+
+      let targetHourIdx = timeArray.indexOf(matchHourStr);
+      if (targetHourIdx === -1) {
+        targetHourIdx = Math.min(etaDate.getHours(), timeArray.length - 1);
+      }
+
+      const rainProb =
+        hourly.precipitation_probability && hourly.precipitation_probability[targetHourIdx] != null
+          ? hourly.precipitation_probability[targetHourIdx]
+          : 0;
+      const rainAmount =
+        hourly.rain && hourly.rain[targetHourIdx] != null ? hourly.rain[targetHourIdx] : 0;
+
+      let status: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
+      if (rainProb >= 50 || rainAmount >= 1.0) {
+        status = 'DANGER';
+      } else if (rainProb >= 25 || rainAmount > 0) {
+        status = 'WARNING';
+      }
+
+      const etaFormatted = `${String(etaDate.getHours()).padStart(2, '0')}:${String(
+        etaDate.getMinutes()
+      ).padStart(2, '0')}`;
+
+      allResults.push({
+        id: globalIndex + 1,
+        lat: pt.lat,
+        lon: pt.lon,
+        etaTime: etaFormatted,
+        rainProbability: rainProb,
+        rainAmountMm: rainAmount,
+        status,
+      });
+    });
+  }
+
+  // 4. ประเมินผลสรุปความเสี่ยง
+  const rainPoints = allResults.filter((p) => p.status !== 'SAFE');
+  const maxProb = Math.max(...allResults.map((p) => p.rainProbability), 0);
+
+  let overallStatus: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
+  let recommendation = `ออกเดินทางเวลา ${departureTimeFormatted} น. ถนนแห้ง ปลอดภัยตลอดสาย ขี่กลับได้สบายครับ`;
+
+  if (allResults.some((p) => p.status === 'DANGER')) {
+    overallStatus = 'DANGER';
+    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีจุดเสี่ยงฝนตกหนักตามเส้นทาง แนะนำเลื่อนเวลาเดินทางหรือเตรียมชุดกันฝน`;
+  } else if (rainPoints.length > 0) {
+    overallStatus = 'WARNING';
+    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีโอกาสเจอละอองฝนบางช่วง ขี่ด้วยความระมัดระวังถนนลื่น`;
+  }
+
+  return {
+    summary: {
+      status: overallStatus,
+      departureTime: departureTimeFormatted,
+      departureOffsetMin,
+      totalDistanceKm: (route.distance / 1000).toFixed(1),
+      totalDurationMin,
+      totalCheckpoints: allResults.length,
+      rainPointsCount: rainPoints.length,
+      maxRainProbability: maxProb,
+      recommendation,
+    },
+    routeGeometry: route.geometry,
+    checkpoints: allResults,
+  };
+}
+
+
 // สร้างไอคอนรูปรถ/ลูกศรนำทางแบบหมุนได้ตาม coords.heading สไตล์ Google Maps
 const createVehicleNavIcon = (heading: number | null) => {
   const rotation = heading !== null && !isNaN(heading) ? Math.round(heading) : 0;
@@ -72,27 +243,79 @@ const createVehicleNavIcon = (heading: number | null) => {
   });
 };
 
-// ควบคุมกล้องแผนที่ให้ติดตามหน้ารถแบบ Real-time (Auto-Follow Camera)
+// ควบคุมกล้องแผนที่ให้ติดตามหน้ารถแบบ Real-time และปรับ POV (Driver POV Zoom 17.5 vs Route Overview)
 function NavigationFollower({
   isTracking,
   autoFollow,
+  setAutoFollow,
   liveLocation,
+  povMode,
+  routeCoords,
 }: {
   isTracking: boolean;
   autoFollow: boolean;
+  setAutoFollow: (val: boolean) => void;
   liveLocation: { lat: number; lon: number } | null;
+  povMode: 'DRIVER' | 'OVERVIEW';
+  routeCoords: [number, number][];
 }) {
   const map = useMap();
 
+  // ดักจับเมื่อผู้ใช้เอานิ้วเลื่อนแผนที่ด้วยตนเอง ให้หยุด auto-follow ชั่วคราว
+  useEffect(() => {
+    const handleDragStart = () => {
+      if (isTracking) {
+        setAutoFollow(false);
+      }
+    };
+    map.on('dragstart', handleDragStart);
+    return () => {
+      map.off('dragstart', handleDragStart);
+    };
+  }, [map, isTracking, setAutoFollow]);
+
+  // ซูมเปลี่ยน POV เมื่อเริ่มนำทาง หรือกดเปลี่ยนปุ่ม POV
+  useEffect(() => {
+    if (!isTracking) return;
+
+    if (povMode === 'DRIVER') {
+      if (liveLocation) {
+        map.flyTo([liveLocation.lat, liveLocation.lon], 17.5, {
+          animate: true,
+          duration: 1.0,
+        });
+      }
+    } else if (povMode === 'OVERVIEW') {
+      if (routeCoords && routeCoords.length > 0) {
+        map.fitBounds(routeCoords, {
+          padding: [50, 50],
+          maxZoom: 15,
+          animate: true,
+        });
+      }
+    }
+  }, [isTracking, povMode]);
+
+  // ติดตามตำแหน่งรถอย่างต่อเนื่องตามโหมด POV
   useEffect(() => {
     if (isTracking && autoFollow && liveLocation) {
-      map.panTo([liveLocation.lat, liveLocation.lon], {
-        animate: true,
-        duration: 0.8,
-        easeLinearity: 0.25,
-      });
+      if (povMode === 'DRIVER') {
+        const currentZoom = map.getZoom();
+        if (currentZoom < 16) {
+          map.setView([liveLocation.lat, liveLocation.lon], 17.5, {
+            animate: true,
+            duration: 0.6,
+          });
+        } else {
+          map.panTo([liveLocation.lat, liveLocation.lon], {
+            animate: true,
+            duration: 0.8,
+            easeLinearity: 0.25,
+          });
+        }
+      }
     }
-  }, [isTracking, autoFollow, liveLocation?.lat, liveLocation?.lon, map]);
+  }, [isTracking, autoFollow, liveLocation?.lat, liveLocation?.lon, povMode, map]);
 
   return null;
 }
@@ -117,7 +340,7 @@ function MapController({
       map.invalidateSize();
     }, 250);
     return () => clearTimeout(timer);
-  }, [map]);
+  }, [map, isTracking]);
 
   useEffect(() => {
     // ถ้ากำลังอยู่ในโหมดติดตามหน้ารถสด จะปล่อยให้ NavigationFollower เป็นตัวคุมกล้อง
@@ -170,6 +393,7 @@ export function App() {
   // ================= ระบบ Live Tracking & Navigation (Google Maps Style) =================
   const [isTracking, setIsTracking] = useState(false);
   const [autoFollow, setAutoFollow] = useState(true);
+  const [povMode, setPovMode] = useState<'DRIVER' | 'OVERVIEW'>('DRIVER');
   const [liveLocation, setLiveLocation] = useState<{
     lat: number;
     lon: number;
@@ -199,8 +423,14 @@ export function App() {
 
       setIsTracking(true);
       setAutoFollow(true);
+      setPovMode('DRIVER');
       if (isMobile) {
         setIsDrawerCollapsed(true);
+      }
+
+      // ถ้ายังไม่มีข้อมูลเส้นทาง ให้สแกนเส้นทางให้อัตโนมัติ
+      if (!data) {
+        handleCheckRain();
       }
 
       watchIdRef.current = navigator.geolocation.watchPosition(
@@ -425,31 +655,55 @@ export function App() {
     setDestinationName(tempOriginName);
   };
 
-  // ยิง API ตรวจสอบเส้นทางพร้อมเวลาออกเดินทาง
+  // ยิง API ตรวจสอบเส้นทางพร้อมเวลาออกเดินทาง (มีระบบ Fallback ไปวิเคราะห์ตรงจากเบราว์เซอร์อัตโนมัติ)
   const handleCheckRain = async () => {
     setLoading(true);
     try {
-      const res = await fetch('https://rain-radar.onrender.com/api/analyze-route', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          origin,
-          destination,
-          sampleIntervalKm: 4,
-          departureOffsetMin,
-        }),
-      });
-      const json = await res.json();
-      if (json.status === 'success') {
-        setData(json.data);
-        if (isMobile) {
-          setIsDrawerCollapsed(true);
+      let resultData: RouteAnalysis | null = null;
+
+      // 1. ลองเชื่อมต่อ API บน Render ก่อน (ตั้ง Timeout 6 วินาที ป้องกันกรณี Render กำลังหลับ Cold Start)
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+        const res = await fetch('https://rain-radar.onrender.com/api/analyze-route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            origin,
+            destination,
+            sampleIntervalKm: 4,
+            departureOffsetMin,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          const json = await res.json();
+          if (json.status === 'success' && json.data) {
+            resultData = json.data;
+          } else {
+            console.warn('Render API returned non-success (e.g. 429 Rate Limit):', json.message);
+          }
+        } else {
+          console.warn(`Render API returned HTTP status ${res.status}`);
         }
-      } else {
-        alert('API Error: ' + json.message);
+      } catch (backendErr: any) {
+        console.warn('Render API connection skipped/timeout:', backendErr.message);
+      }
+
+      // 2. ถ้า Render ติด 429 Rate Limit หรือเซิร์ฟเวอร์หลับ ให้สลับมาวิเคราะห์ในเบราว์เซอร์ผู้ใช้ทันที (Client-Side Fallback)
+      if (!resultData) {
+        resultData = await analyzeRouteClientSide(origin, destination, 4, departureOffsetMin);
+      }
+
+      setData(resultData);
+      if (isMobile) {
+        setIsDrawerCollapsed(true);
       }
     } catch (err: any) {
-      alert('เชื่อมต่อ API (https://rain-radar.onrender.com) ไม่ได้: ' + err.message);
+      alert('ไม่สามารถตรวจสอบเส้นทางได้: ' + (err?.message || 'เกิดข้อผิดพลาดในการดึงข้อมูล'));
     } finally {
       setLoading(false);
     }
@@ -483,43 +737,42 @@ export function App() {
         fontFamily: 'system-ui, -apple-system, sans-serif',
       }}
     >
-      {/* ================= แผงควบคุม (Desktop: ซ้ายมือเต็มจอ / Mobile: ถาดด้านล่าง) ================= */}
-      <div
-        style={
-          isMobile
-            ? {
-                position: 'absolute',
-                bottom: 0,
-                left: 0,
-                right: 0,
-                zIndex: 1000,
-                backgroundColor: '#ffffff',
-                borderTopLeftRadius: '20px',
-                borderTopRightRadius: '20px',
-                boxShadow: '0 -6px 25px rgba(0,0,0,0.22)',
-                maxHeight: isDrawerCollapsed ? '80px' : '84vh',
-                display: 'flex',
-                flexDirection: 'column',
-                transition: 'max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
-                paddingBottom: 'env(safe-area-inset-bottom, 12px)',
-              }
-            : {
-                width: '420px',
-                minWidth: '390px',
-                height: '100vh',
-                padding: '24px',
-                borderRight: '1px solid #e2e8f0',
-                overflowY: 'auto',
-                boxSizing: 'border-box',
-                backgroundColor: '#ffffff',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '16px',
-                boxShadow: '2px 0 12px rgba(0,0,0,0.06)',
-                zIndex: 10,
-              }
-        }
-      >
+      {/* ================= แผงควบคุม (เมื่อเริ่มนำทางจะซ่อนกล่องนี้ทิ้งเพื่อให้เห็นแต่เรากับแมพ) ================= */}
+      {!isTracking && (
+        <div
+          style={
+            isMobile
+              ? {
+                  position: 'absolute',
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  zIndex: 1000,
+                  backgroundColor: '#ffffff',
+                  borderTopLeftRadius: '22px',
+                  borderTopRightRadius: '22px',
+                  boxShadow: '0 -8px 30px rgba(0,0,0,0.22)',
+                  maxHeight: isDrawerCollapsed ? '76px' : '82vh',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  overflow: 'hidden',
+                  transition: 'max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                }
+              : {
+                  width: '420px',
+                  minWidth: '390px',
+                  height: '100vh',
+                  borderRight: '1px solid #e2e8f0',
+                  boxSizing: 'border-box',
+                  backgroundColor: '#ffffff',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  boxShadow: '2px 0 12px rgba(0,0,0,0.06)',
+                  zIndex: 10,
+                  overflow: 'hidden',
+                }
+          }
+        >
         {/* Mobile Header / Grab Handle */}
         {isMobile && (
           <div
@@ -605,15 +858,17 @@ export function App() {
 
         {/* เนื้อหาฟอร์มและผลการวิเคราะห์ */}
         {(!isMobile || !isDrawerCollapsed) && (
-          <div
-            style={{
-              padding: isMobile ? '12px 18px 20px 18px' : '0',
-              overflowY: 'auto',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '14px',
-            }}
-          >
+          <>
+            <div
+              style={{
+                flex: 1,
+                padding: isMobile ? '12px 18px 20px 18px' : '0',
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '14px',
+              }}
+            >
             {/* หัวข้อ */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -669,7 +924,7 @@ export function App() {
                   </div>
                   <div style={{ fontSize: '0.72rem', color: '#64748b' }}>
                     {isTracking
-                      ? `หมุนตามหน้ารถอัตโนมัติ${liveLocation?.speed ? ` • ${liveLocation.speed} กม./ชม.` : ''}`
+                      ? `หมุนตามหน้ารถอัตโนมัติ${liveLocation && liveLocation.speed ? ` • ${liveLocation.speed} กม./ชม.` : ''}`
                       : 'เหมือน Google Maps วิ่งตามตำแหน่งรถ'}
                   </div>
                 </div>
@@ -1092,30 +1347,6 @@ export function App() {
               )}
             </div>
 
-            {/* ปุ่มกดสแกนเส้นทาง */}
-            <button
-              onClick={handleCheckRain}
-              disabled={loading}
-              style={{
-                minHeight: '48px',
-                padding: '12px',
-                backgroundColor: loading ? '#93c5fd' : '#2563eb',
-                color: 'white',
-                border: 'none',
-                borderRadius: '12px',
-                cursor: loading ? 'not-allowed' : 'pointer',
-                fontWeight: 800,
-                fontSize: '1.05rem',
-                boxShadow: '0 4px 14px rgba(37,99,235,0.3)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-              }}
-            >
-              {loading ? '⏳ กำลังคำนวณและสแกนเรดาร์...' : `⚡ สแกนเส้นทาง (${getDepartureTimeLabel(departureOffsetMin)})`}
-            </button>
-
             {/* สรุปผลการวิเคราะห์สภาพอากาศตลอดเส้นทาง */}
             {data && (
               <div
@@ -1169,8 +1400,47 @@ export function App() {
               </div>
             )}
           </div>
-        )}
-      </div>
+
+          {/* Sticky Action Footer: ปุ่มสแกนเส้นทาง ลอยอยู่ด้านล่างตลอดเวลา มองเห็นได้ทันที */}
+          <div
+            style={{
+              position: 'sticky',
+              bottom: 0,
+              backgroundColor: '#ffffff',
+              padding: '12px 18px max(14px, env(safe-area-inset-bottom)) 18px',
+              borderTop: '1px solid #f1f5f9',
+              boxShadow: '0 -4px 16px rgba(0,0,0,0.06)',
+              zIndex: 50,
+            }}
+          >
+            <button
+              onClick={handleCheckRain}
+              disabled={loading}
+              style={{
+                width: '100%',
+                minHeight: '48px',
+                padding: '12px',
+                backgroundColor: loading ? '#93c5fd' : '#2563eb',
+                color: 'white',
+                border: 'none',
+                borderRadius: '14px',
+                cursor: loading ? 'not-allowed' : 'pointer',
+                fontWeight: 800,
+                fontSize: '1.02rem',
+                boxShadow: '0 4px 14px rgba(37,99,235,0.3)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '8px',
+              }}
+            >
+              {loading ? '⏳ กำลังคำนวณและสแกนเรดาร์...' : `⚡ สแกนสภาพอากาศเส้นทาง (${getDepartureTimeLabel(departureOffsetMin)})`}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )}
 
       {/* ================= พื้นที่แผนที่ Leaflet ================= */}
       <div
@@ -1215,7 +1485,10 @@ export function App() {
           <NavigationFollower
             isTracking={isTracking}
             autoFollow={autoFollow}
+            setAutoFollow={setAutoFollow}
             liveLocation={liveLocation}
+            povMode={povMode}
+            routeCoords={polylinePositions}
           />
 
           {/* จุดเริ่มต้น (🟢 Origin Marker - แสดงเมื่อไม่ได้เปิด Live Tracking) */}
@@ -1309,108 +1582,217 @@ export function App() {
           ))}
         </MapContainer>
 
-        {/* แถบแจ้งเตือนสถานะ Live Navigation ด้านบนแผนที่ (HUD) */}
+        {/* ================= โหมดนำทางสดเต็มจอ (เมื่อกดเริ่มเดินทาง: ซ่อน Box เหลือแค่เรากับแมพ) ================= */}
         {isTracking && (
+          <>
+            {/* Top HUD: แถบสถานะความเร็วและสภาพอากาศลอยด้านบน */}
+            <div
+              style={{
+                position: 'absolute',
+                top: 'max(14px, env(safe-area-inset-top))',
+                left: '12px',
+                right: '12px',
+                zIndex: 1000,
+                backgroundColor: 'rgba(15, 23, 42, 0.92)',
+                backdropFilter: 'blur(10px)',
+                borderRadius: '20px',
+                padding: '10px 14px',
+                boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '10px',
+                color: '#ffffff',
+              }}
+            >
+              {/* Digital Speedometer */}
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
+                <span
+                  style={{
+                    fontSize: '1.7rem',
+                    fontWeight: 900,
+                    color: '#38bdf8',
+                    fontVariantNumeric: 'tabular-nums',
+                    lineHeight: 1,
+                  }}
+                >
+                  {liveLocation?.speed != null ? liveLocation.speed : '0'}
+                </span>
+                <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>กม./ชม.</span>
+              </div>
+
+              {/* สรุปสภาพอากาศ & ปลายทาง */}
+              <div style={{ flex: 1, minWidth: 0, textAlign: 'center' }}>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                  <span
+                    style={{
+                      backgroundColor: data ? getStatusColor(data.summary.status) : '#2563eb',
+                      color: '#ffffff',
+                      padding: '3px 10px',
+                      borderRadius: '12px',
+                      fontSize: '0.78rem',
+                      fontWeight: 800,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {data ? getStatusText(data.summary.status) : '🧭 กำลังนำทาง'}
+                  </span>
+                </div>
+                <div
+                  style={{
+                    fontSize: '0.78rem',
+                    color: '#cbd5e1',
+                    marginTop: '2px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  🏁 {destinationName} {data ? `(${data.summary.totalDistanceKm} กม.)` : ''}
+                </div>
+              </div>
+
+              {/* ปุ่มหยุดนำทาง ด่วน (นำ Box กลับมา) */}
+              <button
+                onClick={toggleTracking}
+                style={{
+                  backgroundColor: '#ef4444',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '12px',
+                  padding: '8px 12px',
+                  fontSize: '0.8rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  boxShadow: '0 2px 10px rgba(239,68,68,0.4)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                🛑 หยุด
+              </button>
+            </div>
+
+            {/* Bottom Controls Bar: ปุ่มเปลี่ยน POV มุมมองคนขับ / ภาพรวม และปุ่มจัดกึ่งกลาง */}
+            <div
+              style={{
+                position: 'absolute',
+                bottom: 'max(20px, env(safe-area-inset-bottom))',
+                left: '14px',
+                right: '14px',
+                zIndex: 1000,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '10px',
+                pointerEvents: 'none',
+              }}
+            >
+              {/* ปุ่มเปลี่ยน POV สไตล์ Google Maps (ซูมประชิดตัวรถ 17.5 VS ภาพรวมเส้นทาง) */}
+              <button
+                onClick={() => {
+                  const nextMode = povMode === 'DRIVER' ? 'OVERVIEW' : 'DRIVER';
+                  setPovMode(nextMode);
+                  setAutoFollow(true);
+                }}
+                style={{
+                  pointerEvents: 'auto',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  backgroundColor: povMode === 'DRIVER' ? '#2563eb' : '#0f172a',
+                  color: '#ffffff',
+                  border: '2px solid rgba(255,255,255,0.25)',
+                  borderRadius: '26px',
+                  padding: '12px 20px',
+                  fontSize: '0.92rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  boxShadow: '0 6px 22px rgba(0,0,0,0.35)',
+                  transition: 'all 0.2s ease',
+                }}
+              >
+                {povMode === 'DRIVER' ? (
+                  <>
+                    <span style={{ fontSize: '1.25rem' }}>🛵</span>
+                    <span>มุมมองคนขับ (ซูมใกล้)</span>
+                  </>
+                ) : (
+                  <>
+                    <span style={{ fontSize: '1.25rem' }}>🗺️</span>
+                    <span>ภาพรวมเส้นทาง</span>
+                  </>
+                )}
+              </button>
+
+              {/* ปุ่มล็อคกึ่งกลางรถ (Recenter) เมื่อผู้ใช้เอานิ้วเลื่อนแผนที่ไปดูที่อื่น */}
+              {!autoFollow && (
+                <button
+                  onClick={() => {
+                    setAutoFollow(true);
+                    setPovMode('DRIVER');
+                  }}
+                  style={{
+                    pointerEvents: 'auto',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    backgroundColor: '#10b981',
+                    color: '#ffffff',
+                    border: 'none',
+                    borderRadius: '26px',
+                    padding: '12px 18px',
+                    fontSize: '0.88rem',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                    boxShadow: '0 6px 20px rgba(16,185,129,0.4)',
+                  }}
+                >
+                  <span>🎯</span>
+                  <span>กึ่งกลางรถ</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* ปุ่มลอย Quick Actions บนแผนที่ (แสดงเฉพาะเมื่อยังไม่ได้เริ่มนำทาง) */}
+        {!isTracking && (
           <div
             style={{
               position: 'absolute',
-              top: 'env(safe-area-inset-top, 16px)',
-              left: '50%',
-              transform: 'translateX(-50%)',
+              bottom: isMobile ? (isDrawerCollapsed ? '96px' : '300px') : '24px',
+              right: '16px',
               zIndex: 999,
-              backgroundColor: 'rgba(15, 23, 42, 0.88)',
-              backdropFilter: 'blur(8px)',
-              color: '#ffffff',
-              padding: '8px 16px',
-              borderRadius: '24px',
-              boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
               display: 'flex',
-              alignItems: 'center',
+              flexDirection: 'column',
               gap: '10px',
-              fontSize: '0.85rem',
-              fontWeight: 700,
-              pointerEvents: 'none',
-              whiteSpace: 'nowrap',
+              transition: 'bottom 0.3s ease',
             }}
           >
-            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#10b981', display: 'inline-block', boxShadow: '0 0 8px #10b981' }}></span>
-            <span>กำลังติดตามสด</span>
-            {liveLocation?.speed !== null && (
-              <span style={{ backgroundColor: '#2563eb', padding: '2px 8px', borderRadius: '12px', fontSize: '0.78rem' }}>
-                🏍️ {liveLocation.speed} กม./ชม.
-              </span>
-            )}
-            {liveLocation?.heading !== null && (
-              <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>
-                🧭 {Math.round(liveLocation.heading)}°
-              </span>
-            )}
-          </div>
-        )}
-
-        {/* ปุ่มลอย Quick Actions บนแผนที่ */}
-        <div
-          style={{
-            position: 'absolute',
-            bottom: isMobile ? (isDrawerCollapsed ? '96px' : '300px') : '24px',
-            right: '16px',
-            zIndex: 999,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '10px',
-            transition: 'bottom 0.3s ease',
-          }}
-        >
-          {/* ปุ่มสลับโหมดนำทางสด (Live Tracking Button) */}
-          <button
-            onClick={toggleTracking}
-            style={{
-              width: '48px',
-              height: '48px',
-              borderRadius: '50%',
-              backgroundColor: isTracking ? '#10b981' : '#ffffff',
-              color: isTracking ? '#ffffff' : '#2563eb',
-              border: '2px solid',
-              borderColor: isTracking ? '#ffffff' : '#cbd5e1',
-              boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '1.35rem',
-              transition: 'all 0.2s ease',
-            }}
-            title={isTracking ? 'ปิดโหมดติดตามสด' : 'เปิดโหมดนำทางติดตามสด'}
-          >
-            🧭
-          </button>
-
-          {/* ปุ่มล็อคกึ่งกลางรถ (Recenter / Auto-Follow) เมื่ออยู่ในโหมดติดตาม */}
-          {isTracking && (
+            {/* ปุ่มเริ่มนำทางสด */}
             <button
-              onClick={() => setAutoFollow(true)}
+              onClick={toggleTracking}
               style={{
                 width: '48px',
                 height: '48px',
                 borderRadius: '50%',
-                backgroundColor: autoFollow ? '#2563eb' : '#ffffff',
-                color: autoFollow ? '#ffffff' : '#475569',
-                border: '1px solid #cbd5e1',
-                boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
+                backgroundColor: '#2563eb',
+                color: '#ffffff',
+                border: '2px solid #ffffff',
+                boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
                 cursor: 'pointer',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: '1.2rem',
+                fontSize: '1.3rem',
+                transition: 'all 0.2s ease',
               }}
-              title="ล็อคมุมกล้องให้อยู่ตรงกลางรถ"
+              title="เริ่มนำทางสด"
             >
-              🎯
+              🧭
             </button>
-          )}
 
-          {/* ปุ่มดึง GPS ด่วนครั้งเดียว */}
-          {!isTracking && (
+            {/* ปุ่มดึง GPS ด่วนครั้งเดียว */}
             <button
               onClick={handleGetCurrentLocation}
               disabled={isGpsLoading}
@@ -1431,32 +1813,32 @@ export function App() {
             >
               {isGpsLoading ? '⏳' : '📍'}
             </button>
-          )}
 
-          {/* ปุ่มสลับเปิด/ปิด Drawer สำหรับมือถือ */}
-          {isMobile && (
-            <button
-              onClick={() => setIsDrawerCollapsed(!isDrawerCollapsed)}
-              style={{
-                width: '48px',
-                height: '48px',
-                borderRadius: '50%',
-                backgroundColor: '#0f172a',
-                color: '#ffffff',
-                border: 'none',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: '1.15rem',
-              }}
-              title={isDrawerCollapsed ? 'เปิดแผงควบคุม' : 'ย่อแผงควบคุม'}
-            >
-              {isDrawerCollapsed ? '🗺️' : '⬇️'}
-            </button>
-          )}
-        </div>
+            {/* ปุ่มสลับเปิด/ปิด Drawer สำหรับมือถือ */}
+            {isMobile && (
+              <button
+                onClick={() => setIsDrawerCollapsed(!isDrawerCollapsed)}
+                style={{
+                  width: '48px',
+                  height: '48px',
+                  borderRadius: '50%',
+                  backgroundColor: '#0f172a',
+                  color: '#ffffff',
+                  border: 'none',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '1.15rem',
+                }}
+                title={isDrawerCollapsed ? 'เปิดแผงควบคุม' : 'ย่อแผงควบคุม'}
+              >
+                {isDrawerCollapsed ? '🗺️' : '⬇️'}
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
