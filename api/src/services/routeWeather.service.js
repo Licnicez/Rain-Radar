@@ -15,6 +15,30 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+// จัดรูปแบบเวลาเดินทาง เช่น 25 นาที หรือ 1 ชม. 15 นาที
+function formatDuration(minutes) {
+  if (minutes < 60) return `${minutes} นาที`;
+  const hrs = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem > 0 ? `${hrs} ชม. ${rem} นาที` : `${hrs} ชม.`;
+}
+
+// ตรวจสอบว่าเส้นทางขึ้นทางด่วน/โทลล์เวย์หรือไม่ จาก OpenRouteService extras
+function checkHasTollway(feature) {
+  const tollSummary = feature?.properties?.extras?.tollways?.summary;
+  if (Array.isArray(tollSummary)) {
+    const tollSegment = tollSummary.find((s) => s.value === 1);
+    if (tollSegment && tollSegment.distance > 100) {
+      return {
+        hasTollway: true,
+        tollDistanceKm: (tollSegment.distance / 1000).toFixed(1),
+        tollPercent: Math.round(tollSegment.amount),
+      };
+    }
+  }
+  return { hasTollway: false, tollDistanceKm: '0', tollPercent: 0 };
+}
+
 // ซอยจุดพิกัดตามระยะห่าง (km)
 function sampleRoutePoints(coordinates, intervalKm = 4) {
   if (!coordinates || coordinates.length === 0) return [];
@@ -47,7 +71,6 @@ async function fetchBatchWeather(checkpoints, departureDate, totalDurationMin) {
     const lats = chunk.map((pt) => pt.lat.toFixed(4)).join(',');
     const lons = chunk.map((pt) => pt.lon.toFixed(4)).join(',');
 
-    // forecast_days=2 เพื่อรองรับกรณีเดินทางข้ามวันหรือชั่วโมงล่วงหน้า
     const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=2&timezone=auto`;
 
     let weatherRes;
@@ -74,19 +97,16 @@ async function fetchBatchWeather(checkpoints, departureDate, totalDurationMin) {
       const hourly = wData?.hourly || {};
       const timeArray = hourly.time || [];
 
-      // คำนวณเวลาที่คาดว่าจะเดินทางไปถึงจุดตรวจนี้ (ETA at Checkpoint)
       const progressRatio = checkpoints.length > 1 ? globalIndex / (checkpoints.length - 1) : 0;
       const etaMinutes = progressRatio * totalDurationMin;
       const etaDate = new Date(departureDate.getTime() + etaMinutes * 60 * 1000);
 
-      // แปลงเป็นฟอร์แมต ISO ชั่วโมงของ Open-Meteo เช่น "2026-10-01T21:00"
       const yr = etaDate.getFullYear();
       const mo = String(etaDate.getMonth() + 1).padStart(2, '0');
       const da = String(etaDate.getDate()).padStart(2, '0');
       const hr = String(etaDate.getHours()).padStart(2, '0');
       const matchHourStr = `${yr}-${mo}-${da}T${hr}:00`;
 
-      // หา Index ของชั่วโมงนั้น
       let targetHourIdx = timeArray.indexOf(matchHourStr);
       if (targetHourIdx === -1) {
         targetHourIdx = Math.min(etaDate.getHours(), timeArray.length - 1);
@@ -123,8 +143,71 @@ async function fetchBatchWeather(checkpoints, departureDate, totalDurationMin) {
   return allResults;
 }
 
-export async function analyzeRouteWeather({ origin, destination, sampleIntervalKm = 4, departureOffsetMin = 0 }) {
-  // 1. ดึงเส้นทางจาก OSRM
+const ORS_API_KEY =
+  process.env.ORS_API_KEY ||
+  'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImNhMjQ0ZWMyMmQ3ZTRmMDZiZmUxNmNiYWJiM2U4NDdhIiwiaCI6Im11cm11cjY0In0=';
+
+// ดึงเส้นทางจาก OpenRouteService (ORS) พร้อมรองรับเลี่ยงทางด่วน/โทลล์เวย์/ทางหลวง และดึงทางเลือกหลายเส้นทาง (Alternative Routes)
+async function fetchRoutesFromORS({
+  origin,
+  destination,
+  avoidHighways = true,
+  avoidTollways = true,
+}) {
+  const postUrl = 'https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson';
+
+  const avoid_features = [];
+  if (avoidTollways) avoid_features.push('tollways');
+  if (avoidHighways) avoid_features.push('highways');
+
+  const requestBody = {
+    coordinates: [
+      [Number(origin.lon), Number(origin.lat)],
+      [Number(destination.lon), Number(destination.lat)],
+    ],
+    radiuses: [2000, 2000],
+    alternative_routes: { target_count: 3, weight_factor: 1.6, share_factor: 0.8 },
+    extra_info: ['tollways'],
+  };
+
+  if (avoid_features.length > 0) {
+    requestBody.options = { avoid_features };
+  }
+
+  try {
+    const res = await axios.post(postUrl, requestBody, {
+      timeout: 9000,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: ORS_API_KEY,
+      },
+    });
+
+    const features = res.data?.features;
+    if (features && features.length > 0) {
+      return features.map((feature, i) => {
+        const tollInfo = checkHasTollway(feature);
+        return {
+          id: i,
+          coordinates: feature.geometry.coordinates.map(([lon, lat]) => ({ lat, lon })),
+          distanceMeters: feature.properties?.summary?.distance || 0,
+          durationSeconds: feature.properties?.summary?.duration || 0,
+          hasTollway: tollInfo.hasTollway,
+          tollDistanceKm: tollInfo.tollDistanceKm,
+          tollPercent: tollInfo.tollPercent,
+          geometry: feature.geometry,
+          provider: 'OpenRouteService',
+        };
+      });
+    }
+  } catch (err) {
+    console.warn(
+      'OpenRouteService request failed, falling back to OSRM:',
+      err.response?.data?.error?.message || err.message
+    );
+  }
+
+  // Fallback สำรอง: OSRM
   const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=full&geometries=geojson`;
   const routeRes = await axios.get(osrmUrl, { timeout: 8000 });
   const route = routeRes.data.routes[0];
@@ -133,45 +216,108 @@ export async function analyzeRouteWeather({ origin, destination, sampleIntervalK
     throw new Error('ไม่พบเส้นทาง');
   }
 
-  const coordinates = route.geometry.coordinates.map(([lon, lat]) => ({ lat, lon }));
-  const checkpoints = sampleRoutePoints(coordinates, sampleIntervalKm);
-  const totalDurationMin = Math.round(route.duration / 60);
+  return [
+    {
+      id: 0,
+      coordinates: route.geometry.coordinates.map(([lon, lat]) => ({ lat, lon })),
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      hasTollway: false,
+      tollDistanceKm: '0',
+      tollPercent: 0,
+      geometry: route.geometry,
+      provider: 'OSRM (Fallback)',
+    },
+  ];
+}
 
-  // 2. คำนวณเวลาออกเดินทางจริง (Target Departure Time)
+export async function analyzeRouteWeather({
+  origin,
+  destination,
+  sampleIntervalKm = 4,
+  departureOffsetMin = 0,
+  vehicleType = 'motorcycle',
+  avoidHighways = true,
+  avoidTollways = true,
+}) {
+  // 1. ดึงเส้นทาง (พร้อมทางเลือกหลายเส้นทาง) จาก OpenRouteService
+  const routesData = await fetchRoutesFromORS({ origin, destination, avoidHighways, avoidTollways });
+
   const departureDate = new Date(Date.now() + departureOffsetMin * 60 * 1000);
-  const departureTimeFormatted = `${String(departureDate.getHours()).padStart(2, '0')}:${String(departureDate.getMinutes()).padStart(2, '0')}`;
+  const departureTimeFormatted = `${String(departureDate.getHours()).padStart(2, '0')}:${String(
+    departureDate.getMinutes()
+  ).padStart(2, '0')}`;
 
-  // 3. ดึงสภาพอากาศจาก Open-Meteo ตามชั่วโมงที่เดินทางจริง
-  const checkpointResults = await fetchBatchWeather(checkpoints, departureDate, totalDurationMin);
+  const vehicleLabel = vehicleType === 'motorcycle' ? 'มอเตอร์ไซค์' : 'รถยนต์';
+  const routeOptions = [];
 
-  // 4. สรุปภาพรวม
-  const rainPoints = checkpointResults.filter((p) => p.status !== 'SAFE');
-  const maxProb = Math.max(...checkpointResults.map((p) => p.rainProbability), 0);
+  // 2. วิเคราะห์สภาพอากาศสำหรับแต่ละเส้นทาง
+  for (let idx = 0; idx < routesData.length; idx++) {
+    const route = routesData[idx];
+    const checkpoints = sampleRoutePoints(route.coordinates, sampleIntervalKm);
+    const totalDurationMin = Math.round(route.durationSeconds / 60);
 
-  let overallStatus = 'SAFE';
-  let recommendation = `ออกเดินทางเวลา ${departureTimeFormatted} น. ถนนแห้ง ปลอดภัยตลอดสาย ขี่กลับได้สบายครับ`;
+    const checkpointResults = await fetchBatchWeather(checkpoints, departureDate, totalDurationMin);
 
-  if (checkpointResults.some((p) => p.status === 'DANGER')) {
-    overallStatus = 'DANGER';
-    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีจุดเสี่ยงฝนตกหนักตามเส้นทาง แนะนำเลื่อนเวลาเดินทางหรือเตรียมชุดกันฝน`;
-  } else if (rainPoints.length > 0) {
-    overallStatus = 'WARNING';
-    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีโอกาสเจอละอองฝนบางช่วง ขี่ด้วยความระมัดระวังถนนลื่น`;
+    const rainPoints = checkpointResults.filter((p) => p.status !== 'SAFE');
+    const maxProb = Math.max(...checkpointResults.map((p) => p.rainProbability), 0);
+
+    let overallStatus = 'SAFE';
+    let recommendation = `ออกเดินทางเวลา ${departureTimeFormatted} น. สำหรับ${vehicleLabel} (เส้นทางที่ ${idx + 1}) ถนนแห้ง ปลอดภัยตลอดสาย เดินทางได้สบายครับ`;
+
+    if (checkpointResults.some((p) => p.status === 'DANGER')) {
+      overallStatus = 'DANGER';
+      recommendation = `หากออกเวลา ${departureTimeFormatted} น. สำหรับ${vehicleLabel} (เส้นทางที่ ${idx + 1}) มีจุดเสี่ยงฝนตกหนักตามเส้นทาง แนะนำเลื่อนเวลาเดินทางหรือเตรียมชุดกันฝน`;
+    } else if (rainPoints.length > 0) {
+      overallStatus = 'WARNING';
+      recommendation = `หากออกเวลา ${departureTimeFormatted} น. สำหรับ${vehicleLabel} (เส้นทางที่ ${idx + 1}) มีโอกาสเจอละอองฝนบางช่วง ขับขี่ด้วยความระมัดระวังถนนลื่น`;
+    }
+
+    const routeName = idx === 0 ? 'เส้นทางที่ 1 (แนะนำ)' : `เส้นทางที่ ${idx + 1} (ทางเลือก)`;
+
+    routeOptions.push({
+      id: idx,
+      name: routeName,
+      distanceKm: (route.distanceMeters / 1000).toFixed(1),
+      durationMin: totalDurationMin,
+      durationFormatted: formatDuration(totalDurationMin),
+      hasTollway: route.hasTollway,
+      tollDistanceKm: route.tollDistanceKm,
+      tollPercent: route.tollPercent,
+      status: overallStatus,
+      maxRainProbability: maxProb,
+      rainPointsCount: rainPoints.length,
+      recommendation,
+      geometry: route.geometry,
+      coordinates: route.coordinates,
+      checkpoints: checkpointResults,
+      routingProvider: route.provider,
+    });
   }
+
+  const primaryRoute = routeOptions[0];
 
   return {
     summary: {
-      status: overallStatus,
+      status: primaryRoute.status,
       departureTime: departureTimeFormatted,
       departureOffsetMin,
-      totalDistanceKm: (route.distance / 1000).toFixed(1),
-      totalDurationMin,
-      totalCheckpoints: checkpointResults.length,
-      rainPointsCount: rainPoints.length,
-      maxRainProbability: maxProb,
-      recommendation,
+      vehicleType,
+      avoidHighways: Boolean(avoidHighways),
+      avoidTollways: Boolean(avoidTollways),
+      totalDistanceKm: primaryRoute.distanceKm,
+      totalDurationMin: primaryRoute.durationMin,
+      durationFormatted: primaryRoute.durationFormatted,
+      hasTollway: primaryRoute.hasTollway,
+      tollDistanceKm: primaryRoute.tollDistanceKm,
+      totalCheckpoints: primaryRoute.checkpoints.length,
+      rainPointsCount: primaryRoute.rainPointsCount,
+      maxRainProbability: primaryRoute.maxRainProbability,
+      recommendation: primaryRoute.recommendation,
+      routingProvider: primaryRoute.routingProvider,
     },
-    routeGeometry: route.geometry,
-    checkpoints: checkpointResults,
+    routes: routeOptions,
+    routeGeometry: primaryRoute.geometry,
+    checkpoints: primaryRoute.checkpoints,
   };
 }

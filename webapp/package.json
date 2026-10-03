@@ -9,6 +9,7 @@
     "build": "bun run build.ts"
   },
   "dependencies": {
+    "@iconify/react": "^6.0.2",
     "bun-plugin-tailwind": "^0.1.2",
     "leaflet": "^1.9.4",
     "react": "^19",

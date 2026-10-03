@@ -1,4 +1,4 @@
-const CACHE_NAME = 'moto-rain-v1';
+const CACHE_NAME = 'rrd-maps-v5';
 const STATIC_ASSETS = [
   '/',
   '/manifest.json',

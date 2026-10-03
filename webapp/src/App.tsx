@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, Polyline, CircleMarker, Marker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Polyline, CircleMarker, Marker, Popup, GeoJSON, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import { Icon } from '@iconify/react';
 
-interface Checkpoint {
+export interface Checkpoint {
   id: number;
   lat: number;
   lon: number;
@@ -13,25 +14,55 @@ interface Checkpoint {
   status: 'SAFE' | 'WARNING' | 'DANGER';
 }
 
-interface RouteAnalysis {
+export interface RouteOption {
+  id: number;
+  name: string;
+  distanceKm: string;
+  durationMin: number;
+  durationFormatted: string;
+  hasTollway: boolean;
+  tollDistanceKm: string;
+  status: 'SAFE' | 'WARNING' | 'DANGER';
+  maxRainProbability: number;
+  rainPointsCount: number;
+  recommendation: string;
+  geometry: {
+    type: string;
+    coordinates: [number, number][];
+  };
+  coordinates: { lat: number; lon: number }[];
+  checkpoints: Checkpoint[];
+  routingProvider?: string;
+}
+
+export interface RouteAnalysis {
   summary: {
     status: 'SAFE' | 'WARNING' | 'DANGER';
     departureTime?: string;
     departureOffsetMin?: number;
+    vehicleType?: 'motorcycle' | 'car';
+    avoidHighways?: boolean;
+    avoidTollways?: boolean;
     totalDistanceKm: string;
     totalDurationMin: number;
+    durationFormatted?: string;
+    hasTollway?: boolean;
+    tollDistanceKm?: string;
     totalCheckpoints: number;
     rainPointsCount: number;
     maxRainProbability: number;
     recommendation: string;
+    routingProvider?: string;
   };
+  routes?: RouteOption[];
   routeGeometry: {
-    coordinates: [number, number][]; // [lon, lat]
+    type: string;
+    coordinates: [number, number][];
   };
   checkpoints: Checkpoint[];
 }
 
-interface PlaceSuggestion {
+export interface PlaceSuggestion {
   place_id: number | string;
   display_name: string;
   lat: string;
@@ -39,7 +70,6 @@ interface PlaceSuggestion {
   name?: string;
 }
 
-// ฟังก์ชันคำนวณทิศทางการหันหน้า (Bearing 0-360 องศา) จาก 2 พิกัดล่าสุด
 function calculateBearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const y = Math.sin(((lon2 - lon1) * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180);
   const x =
@@ -49,7 +79,6 @@ function calculateBearing(lat1: number, lon1: number, lat2: number, lon2: number
   return (brng + 360) % 360;
 }
 
-// คำนวณระยะห่างระหว่างจุด (Haversine formula - กิโลเมตร)
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -64,7 +93,28 @@ function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: numbe
   return R * c;
 }
 
-// ซอยจุดพิกัดตามระยะห่าง (km)
+function formatDuration(minutes: number): string {
+  if (minutes < 60) return `${minutes} นาที`;
+  const hrs = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem > 0 ? `${hrs} ชม. ${rem} นาที` : `${hrs} ชม.`;
+}
+
+function checkHasTollway(feature: any) {
+  const tollSummary = feature?.properties?.extras?.tollways?.summary;
+  if (Array.isArray(tollSummary)) {
+    const tollSegment = tollSummary.find((s: any) => s.value === 1);
+    if (tollSegment && tollSegment.distance > 100) {
+      return {
+        hasTollway: true,
+        tollDistanceKm: (tollSegment.distance / 1000).toFixed(1),
+        tollPercent: Math.round(tollSegment.amount),
+      };
+    }
+  }
+  return { hasTollway: false, tollDistanceKm: '0', tollPercent: 0 };
+}
+
 function sampleRoutePoints(coordinates: { lat: number; lon: number }[], intervalKm = 4) {
   if (!coordinates || coordinates.length === 0) return [];
   const sampled = [coordinates[0]];
@@ -86,15 +136,73 @@ function sampleRoutePoints(coordinates: { lat: number; lon: number }[], interval
   return sampled;
 }
 
-// วิเคราะห์เส้นทางและสภาพอากาศโดยตรงบนเบราว์เซอร์ผู้ใช้ (Client-Side Fallback)
-// ช่วยป้องกันปัญหา Render Free Tier ติด Rate Limit 429 หรือ Cold Start หลับ
-async function analyzeRouteClientSide(
-  origin: { lat: number; lon: number },
-  destination: { lat: number; lon: number },
-  sampleIntervalKm = 4,
-  departureOffsetMin = 0
-): Promise<RouteAnalysis> {
-  // 1. ดึงเส้นทางจาก OSRM
+const ORS_API_KEY =
+  'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImNhMjQ0ZWMyMmQ3ZTRmMDZiZmUxNmNiYWJiM2U4NDdhIiwiaCI6Im11cm11cjY0In0=';
+
+async function fetchRoutesFromORSClient({
+  origin,
+  destination,
+  avoidHighways = true,
+  avoidTollways = true,
+}: {
+  origin: { lat: number; lon: number };
+  destination: { lat: number; lon: number };
+  avoidHighways?: boolean;
+  avoidTollways?: boolean;
+}) {
+  const postUrl = 'https://api.heigit.org/openrouteservice/v2/directions/driving-car/geojson';
+
+  const avoid_features: string[] = [];
+  if (avoidTollways) avoid_features.push('tollways');
+  if (avoidHighways) avoid_features.push('highways');
+
+  const requestBody: any = {
+    coordinates: [
+      [Number(origin.lon), Number(origin.lat)],
+      [Number(destination.lon), Number(destination.lat)],
+    ],
+    radiuses: [2000, 2000],
+    alternative_routes: { target_count: 3, weight_factor: 1.6, share_factor: 0.8 },
+    extra_info: ['tollways'],
+  };
+
+  if (avoid_features.length > 0) {
+    requestBody.options = { avoid_features };
+  }
+
+  try {
+    const res = await fetch(postUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: ORS_API_KEY,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const features = data?.features;
+      if (features && features.length > 0) {
+        return features.map((feature: any, i: number) => {
+          const tollInfo = checkHasTollway(feature);
+          return {
+            id: i,
+            coordinates: feature.geometry.coordinates.map(([lon, lat]: [number, number]) => ({ lat, lon })),
+            distanceMeters: feature.properties?.summary?.distance || 0,
+            durationSeconds: feature.properties?.summary?.duration || 0,
+            hasTollway: tollInfo.hasTollway,
+            tollDistanceKm: tollInfo.tollDistanceKm,
+            geometry: feature.geometry,
+            provider: 'OpenRouteService',
+          };
+        });
+      }
+    }
+  } catch (err: any) {
+    console.warn('ORS client fetch failed, falling back to OSRM:', err?.message);
+  }
+
   const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=full&geometries=geojson`;
   const routeRes = await fetch(osrmUrl);
   if (!routeRes.ok) {
@@ -106,162 +214,299 @@ async function analyzeRouteClientSide(
     throw new Error('ไม่พบข้อมูลเส้นทางระหว่างจุดสองจุดนี้');
   }
 
-  const coordinates: { lat: number; lon: number }[] = route.geometry.coordinates.map(
-    ([lon, lat]: [number, number]) => ({ lat, lon })
-  );
-  const checkpoints = sampleRoutePoints(coordinates, sampleIntervalKm);
-  const totalDurationMin = Math.round(route.duration / 60);
+  return [
+    {
+      id: 0,
+      coordinates: route.geometry.coordinates.map(([lon, lat]: [number, number]) => ({ lat, lon })),
+      distanceMeters: route.distance,
+      durationSeconds: route.duration,
+      hasTollway: false,
+      tollDistanceKm: '0',
+      geometry: route.geometry,
+      provider: 'OSRM (Fallback)',
+    },
+  ];
+}
 
-  // 2. คำนวณเวลาออกเดินทางจริง
+async function analyzeRouteClientSide({
+  origin,
+  destination,
+  sampleIntervalKm = 4,
+  departureOffsetMin = 0,
+  vehicleType = 'motorcycle',
+  avoidHighways = true,
+  avoidTollways = true,
+}: {
+  origin: { lat: number; lon: number };
+  destination: { lat: number; lon: number };
+  sampleIntervalKm?: number;
+  departureOffsetMin?: number;
+  vehicleType?: 'motorcycle' | 'car';
+  avoidHighways?: boolean;
+  avoidTollways?: boolean;
+}): Promise<RouteAnalysis> {
+  const routesData = await fetchRoutesFromORSClient({ origin, destination, avoidHighways, avoidTollways });
+
   const departureDate = new Date(Date.now() + departureOffsetMin * 60 * 1000);
   const departureTimeFormatted = `${String(departureDate.getHours()).padStart(2, '0')}:${String(
     departureDate.getMinutes()
   ).padStart(2, '0')}`;
 
-  // 3. ดึงสภาพอากาศจาก Open-Meteo แบบ Batch
-  const batchSize = 30;
-  const allResults: Checkpoint[] = [];
+  const vehicleLabel = vehicleType === 'motorcycle' ? 'มอเตอร์ไซค์' : 'รถยนต์';
+  const routeOptions: RouteOption[] = [];
 
-  for (let i = 0; i < checkpoints.length; i += batchSize) {
-    const chunk = checkpoints.slice(i, i + batchSize);
-    const lats = chunk.map((pt) => pt.lat.toFixed(4)).join(',');
-    const lons = chunk.map((pt) => pt.lon.toFixed(4)).join(',');
+  for (let idx = 0; idx < routesData.length; idx++) {
+    const route = routesData[idx];
+    const checkpoints = sampleRoutePoints(route.coordinates, sampleIntervalKm);
+    const totalDurationMin = Math.round(route.durationSeconds / 60);
 
-    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=2&timezone=auto`;
-    const weatherRes = await fetch(weatherUrl);
-    if (!weatherRes.ok) {
-      throw new Error('ไม่สามารถดึงข้อมูลพยากรณ์อากาศจาก Open-Meteo ได้');
-    }
-    const weatherData = await weatherRes.json();
-    const weatherList = Array.isArray(weatherData) ? weatherData : [weatherData];
+    const batchSize = 30;
+    const allResults: Checkpoint[] = [];
 
-    chunk.forEach((pt, index) => {
-      const globalIndex = i + index;
-      const wData = weatherList[index] || weatherList[0];
-      const hourly = wData?.hourly || {};
-      const timeArray: string[] = hourly.time || [];
+    for (let i = 0; i < checkpoints.length; i += batchSize) {
+      const chunk = checkpoints.slice(i, i + batchSize);
+      const lats = chunk.map((pt) => pt.lat.toFixed(4)).join(',');
+      const lons = chunk.map((pt) => pt.lon.toFixed(4)).join(',');
 
-      // คำนวณเวลาที่คาดว่าจะเดินทางไปถึงจุดตรวจนี้ (ETA)
-      const progressRatio = checkpoints.length > 1 ? globalIndex / (checkpoints.length - 1) : 0;
-      const etaMinutes = progressRatio * totalDurationMin;
-      const etaDate = new Date(departureDate.getTime() + etaMinutes * 60 * 1000);
-
-      const yr = etaDate.getFullYear();
-      const mo = String(etaDate.getMonth() + 1).padStart(2, '0');
-      const da = String(etaDate.getDate()).padStart(2, '0');
-      const hr = String(etaDate.getHours()).padStart(2, '0');
-      const matchHourStr = `${yr}-${mo}-${da}T${hr}:00`;
-
-      let targetHourIdx = timeArray.indexOf(matchHourStr);
-      if (targetHourIdx === -1) {
-        targetHourIdx = Math.min(etaDate.getHours(), timeArray.length - 1);
+      const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&hourly=precipitation_probability,rain&forecast_days=2&timezone=auto`;
+      const weatherRes = await fetch(weatherUrl);
+      if (!weatherRes.ok) {
+        throw new Error('ไม่สามารถดึงข้อมูลพยากรณ์อากาศจาก Open-Meteo ได้');
       }
+      const weatherData = await weatherRes.json();
+      const weatherList = Array.isArray(weatherData) ? weatherData : [weatherData];
 
-      const rainProb =
-        hourly.precipitation_probability && hourly.precipitation_probability[targetHourIdx] != null
-          ? hourly.precipitation_probability[targetHourIdx]
-          : 0;
-      const rainAmount =
-        hourly.rain && hourly.rain[targetHourIdx] != null ? hourly.rain[targetHourIdx] : 0;
+      chunk.forEach((pt, index) => {
+        const globalIndex = i + index;
+        const wData = weatherList[index] || weatherList[0];
+        const hourly = wData?.hourly || {};
+        const timeArray: string[] = hourly.time || [];
 
-      let status: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
-      if (rainProb >= 50 || rainAmount >= 1.0) {
-        status = 'DANGER';
-      } else if (rainProb >= 25 || rainAmount > 0) {
-        status = 'WARNING';
-      }
+        const progressRatio = checkpoints.length > 1 ? globalIndex / (checkpoints.length - 1) : 0;
+        const etaMinutes = progressRatio * totalDurationMin;
+        const etaDate = new Date(departureDate.getTime() + etaMinutes * 60 * 1000);
 
-      const etaFormatted = `${String(etaDate.getHours()).padStart(2, '0')}:${String(
-        etaDate.getMinutes()
-      ).padStart(2, '0')}`;
+        const yr = etaDate.getFullYear();
+        const mo = String(etaDate.getMonth() + 1).padStart(2, '0');
+        const da = String(etaDate.getDate()).padStart(2, '0');
+        const hr = String(etaDate.getHours()).padStart(2, '0');
+        const matchHourStr = `${yr}-${mo}-${da}T${hr}:00`;
 
-      allResults.push({
-        id: globalIndex + 1,
-        lat: pt.lat,
-        lon: pt.lon,
-        etaTime: etaFormatted,
-        rainProbability: rainProb,
-        rainAmountMm: rainAmount,
-        status,
+        let timeIdx = timeArray.findIndex((t: string) => t.startsWith(matchHourStr));
+        if (timeIdx === -1) {
+          timeIdx = 0;
+        }
+
+        const rainProb = (hourly.precipitation_probability && hourly.precipitation_probability[timeIdx]) ?? 0;
+        const rainAmount = (hourly.rain && hourly.rain[timeIdx]) ?? 0;
+
+        let status: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
+        if (rainProb > 60 || rainAmount >= 2.5) {
+          status = 'DANGER';
+        } else if (rainProb > 30 || rainAmount > 0.5) {
+          status = 'WARNING';
+        }
+
+        const etaFormatted = `${String(etaDate.getHours()).padStart(2, '0')}:${String(etaDate.getMinutes()).padStart(
+          2,
+          '0'
+        )}`;
+
+        allResults.push({
+          id: globalIndex + 1,
+          lat: pt.lat,
+          lon: pt.lon,
+          etaTime: etaFormatted,
+          rainProbability: rainProb,
+          rainAmountMm: rainAmount,
+          status,
+        });
       });
+    }
+
+    const rainPoints = allResults.filter((cp) => cp.status !== 'SAFE');
+    const dangerPoints = allResults.filter((cp) => cp.status === 'DANGER');
+    let overallStatus: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
+
+    if (dangerPoints.length > 0) {
+      overallStatus = 'DANGER';
+    } else if (rainPoints.length > 0) {
+      overallStatus = 'WARNING';
+    }
+
+    const maxProb = allResults.reduce((max, cp) => Math.max(max, cp.rainProbability), 0);
+
+    let recommendation = `เส้นทางสะดวก ขับขี่${vehicleLabel}ได้ปลอดภัยตลอดทาง แดดดีหรือถนนแห้ง`;
+    if (overallStatus === 'DANGER') {
+      recommendation = `พบจุดฝนตกหนักหรือมีความเสี่ยงสูง แนะนำเตรียมชุดกันฝน หรือหลีกเลี่ยงการเดินทางช่วงเวลานี้`;
+    } else if (overallStatus === 'WARNING') {
+      recommendation = `มีโอกาสพบละอองฝนบางช่วง ขับขี่ด้วยความระมัดระวัง ลดความเร็วลง`;
+    }
+
+    const routeName = idx === 0 ? 'เส้นทางที่ 1 (แนะนำ)' : `เส้นทางที่ ${idx + 1} (ทางเลือก)`;
+
+    routeOptions.push({
+      id: idx,
+      name: routeName,
+      distanceKm: (route.distanceMeters / 1000).toFixed(1),
+      durationMin: totalDurationMin,
+      durationFormatted: formatDuration(totalDurationMin),
+      hasTollway: Boolean(route.hasTollway),
+      tollDistanceKm: route.tollDistanceKm || '0',
+      status: overallStatus,
+      maxRainProbability: maxProb,
+      rainPointsCount: rainPoints.length,
+      recommendation,
+      geometry: route.geometry,
+      coordinates: route.coordinates,
+      checkpoints: allResults,
+      routingProvider: route.provider,
     });
   }
 
-  // 4. ประเมินผลสรุปความเสี่ยง
-  const rainPoints = allResults.filter((p) => p.status !== 'SAFE');
-  const maxProb = Math.max(...allResults.map((p) => p.rainProbability), 0);
-
-  let overallStatus: 'SAFE' | 'WARNING' | 'DANGER' = 'SAFE';
-  let recommendation = `ออกเดินทางเวลา ${departureTimeFormatted} น. ถนนแห้ง ปลอดภัยตลอดสาย ขี่กลับได้สบายครับ`;
-
-  if (allResults.some((p) => p.status === 'DANGER')) {
-    overallStatus = 'DANGER';
-    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีจุดเสี่ยงฝนตกหนักตามเส้นทาง แนะนำเลื่อนเวลาเดินทางหรือเตรียมชุดกันฝน`;
-  } else if (rainPoints.length > 0) {
-    overallStatus = 'WARNING';
-    recommendation = `หากออกเวลา ${departureTimeFormatted} น. มีโอกาสเจอละอองฝนบางช่วง ขี่ด้วยความระมัดระวังถนนลื่น`;
-  }
+  const primaryRoute = routeOptions[0];
 
   return {
     summary: {
-      status: overallStatus,
+      status: primaryRoute.status,
       departureTime: departureTimeFormatted,
       departureOffsetMin,
-      totalDistanceKm: (route.distance / 1000).toFixed(1),
-      totalDurationMin,
-      totalCheckpoints: allResults.length,
-      rainPointsCount: rainPoints.length,
-      maxRainProbability: maxProb,
-      recommendation,
+      vehicleType,
+      avoidHighways: Boolean(avoidHighways),
+      avoidTollways: Boolean(avoidTollways),
+      totalDistanceKm: primaryRoute.distanceKm,
+      totalDurationMin: primaryRoute.durationMin,
+      durationFormatted: primaryRoute.durationFormatted,
+      hasTollway: primaryRoute.hasTollway,
+      tollDistanceKm: primaryRoute.tollDistanceKm,
+      totalCheckpoints: primaryRoute.checkpoints.length,
+      rainPointsCount: primaryRoute.rainPointsCount,
+      maxRainProbability: primaryRoute.maxRainProbability,
+      recommendation: primaryRoute.recommendation,
+      routingProvider: primaryRoute.routingProvider,
     },
-    routeGeometry: route.geometry,
-    checkpoints: allResults,
+    routes: routeOptions,
+    routeGeometry: primaryRoute.geometry,
+    checkpoints: primaryRoute.checkpoints,
   };
 }
 
-
-// สร้างไอคอนรูปรถ/ลูกศรนำทางแบบหมุนได้ตาม coords.heading สไตล์ Google Maps
-const createVehicleNavIcon = (heading: number | null) => {
-  const rotation = heading !== null && !isNaN(heading) ? Math.round(heading) : 0;
+const createSelectedRouteBadge = (route: RouteOption, idx?: number) => {
+  const isRain = route.maxRainProbability > 30;
   return L.divIcon({
-    className: 'nav-vehicle-marker',
+    className: 'route-badge-selected',
     html: `
-      <div style="position: relative; width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;">
-        <!-- วงแหวนคลื่นเรดาร์กระพริบ -->
-        <div style="position: absolute; width: 44px; height: 44px; border-radius: 50%; background: rgba(37,99,235,0.25); animation: navPulse 2s ease-out infinite;"></div>
-        <!-- ลูกศรหน้ารถ หมุนตาม Heading -->
-        <div style="transform: rotate(${rotation}deg); transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1); width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; filter: drop-shadow(0 3px 6px rgba(0,0,0,0.4));">
-          <svg width="34" height="34" viewBox="0 0 32 32" fill="none">
-            <path d="M16 2 L29 27 L16 21 L3 27 Z" fill="#2563eb" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round"/>
-            <circle cx="16" cy="15" r="3.5" fill="#38bdf8"/>
-          </svg>
+      <div style="position: relative; transform: translate(-50%, -100%); cursor: pointer; pointer-events: auto;">
+        <div style="background: #1a73e8; color: #ffffff; padding: 6px 12px; border-radius: 14px; box-shadow: 0 4px 18px rgba(26,115,232,0.45); font-family: 'Prompt', sans-serif; white-space: nowrap; border: 2.5px solid #ffffff; display: flex; flex-direction: column; align-items: center; min-width: 95px; pointer-events: auto;">
+          <div style="display: flex; align-items: center; gap: 5px; font-weight: 900; font-size: 0.88rem;">
+            <span>${route.durationFormatted || route.durationMin + ' นาที'}</span>
+            <span>${isRain ? '🌧️' : '🍃'}</span>
+          </div>
+          <div style="font-size: 0.72rem; opacity: 0.95; font-weight: 700; margin-top: 1px;">
+            ${route.hasTollway ? 'Tolls (ทางด่วน)' : 'No tolls (ทางราบ)'}
+          </div>
         </div>
+        <div style="width: 0; height: 0; border-left: 7px solid transparent; border-right: 7px solid transparent; border-top: 8px solid #1a73e8; margin: 0 auto;"></div>
       </div>
     `,
-    iconSize: [48, 48],
-    iconAnchor: [24, 24],
+    iconSize: [115, 50],
+    iconAnchor: [57.5, 50],
   });
 };
 
-// ควบคุมกล้องแผนที่ให้ติดตามหน้ารถแบบ Real-time และปรับ POV (Driver POV Zoom 17.5 vs Route Overview)
+const createAltRouteBadge = (route: RouteOption, idx?: number) => {
+  const isRain = route.maxRainProbability > 30;
+  const clickAttr = typeof idx === 'number' ? `onclick="if(window.__selectRoute){window.__selectRoute(${idx});}"` : '';
+  return L.divIcon({
+    className: 'route-badge-alt',
+    html: `
+      <div ${clickAttr} style="position: relative; transform: translate(-50%, -100%); cursor: pointer; pointer-events: auto;">
+        <div style="background: #ffffff; color: #3c4043; padding: 6px 11px; border-radius: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.18); font-family: 'Prompt', sans-serif; white-space: nowrap; border: 1.5px solid #dadce0; display: flex; flex-direction: column; align-items: center; min-width: 90px; pointer-events: auto;">
+          <div style="display: flex; align-items: center; gap: 5px; font-weight: 800; font-size: 0.85rem; color: #202124;">
+            <span>${route.durationFormatted || route.durationMin + ' นาที'}</span>
+            <span>${isRain ? '🌧️' : '🍃'}</span>
+          </div>
+          <div style="font-size: 0.7rem; color: #5f6368; font-weight: 600; margin-top: 1px;">
+            ${route.hasTollway ? 'Tolls' : 'No tolls'}
+          </div>
+        </div>
+        <div style="width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 7px solid #ffffff; margin: 0 auto;"></div>
+      </div>
+    `,
+    iconSize: [110, 48],
+    iconAnchor: [55, 48],
+  });
+};
+
+const createVehicleNavIcon = (heading: number | null, vehicleType: 'motorcycle' | 'car' = 'motorcycle') => {
+  const rotation = heading !== null && !isNaN(heading) ? Math.round(heading) : 0;
+  const isCar = vehicleType === 'car';
+  const pulseColor = isCar ? 'rgba(59, 130, 246, 0.35)' : 'rgba(16, 185, 129, 0.35)';
+  const badgeColor = isCar ? '#2563eb' : '#059669';
+
+  const iconSvg = isCar
+    ? `<path d="M5 11l1.5-4.5A2 2 0 0 1 8.4 5h7.2a2 2 0 0 1 1.9 1.5L19 11M3 11h18v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/><circle cx="7.5" cy="15" r="1.5" fill="#ffffff"/><circle cx="16.5" cy="15" r="1.5" fill="#ffffff"/>`
+    : `<circle cx="6" cy="16" r="3" stroke="#ffffff" stroke-width="2" fill="none"/><circle cx="18" cy="16" r="3" stroke="#ffffff" stroke-width="2" fill="none"/><path d="M6 16l4-6h4l3 6M12 10V6h3" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+
+  return L.divIcon({
+    className: 'nav-vehicle-marker',
+    html: `
+      <div style="position: relative; width: 68px; height: 68px; display: flex; align-items: center; justify-content: center;">
+        <!-- Pulsing Radar Pulse Ring -->
+        <div style="position: absolute; width: 60px; height: 60px; border-radius: 50%; background: ${pulseColor}; animation: navPulse 2s ease-out infinite;"></div>
+
+        <!-- Rotating Direction & Vehicle Container (หมุนตามทิศ heading พร้อมลูกศรบอกทิศ) -->
+        <div style="position: absolute; width: 68px; height: 68px; transform: rotate(${rotation}deg); transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1); pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center;">
+          
+          <!-- ลูกศรบอกทิศทางขนาดใหญ่ที่หัวเรา ชี้ไปข้างหน้าชัดเจน -->
+          <div style="position: absolute; top: 0px; z-index: 5; filter: drop-shadow(0 2px 5px rgba(0,0,0,0.45));">
+            <svg width="22" height="18" viewBox="0 0 22 18" fill="none">
+              <path d="M11 1L20 16L11 12.5L2 16L11 1Z" fill="${isCar ? '#2563eb' : '#059669'}" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round"/>
+            </svg>
+          </div>
+
+          <!-- ลำแสงพุ่งไปข้างหน้า (Forward Heading Beam) -->
+          <div style="position: absolute; top: 2px; width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent; border-bottom: 24px solid rgba(56, 189, 248, 0.45); filter: blur(2px);"></div>
+
+          <!-- วงกลมสัญลักษณ์ยานพาหนะตรงกลาง -->
+          <div style="position: relative; width: 40px; height: 40px; border-radius: 50%; background: ${badgeColor}; box-shadow: 0 4px 16px rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; border: 2.8px solid #ffffff; z-index: 4;">
+            <div style="display: flex; align-items: center; justify-content: center; width: 24px; height: 24px;">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                ${iconSvg}
+              </svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    `,
+    iconSize: [68, 68],
+    iconAnchor: [34, 34],
+  });
+};
+
 function NavigationFollower({
   isTracking,
   autoFollow,
   setAutoFollow,
   liveLocation,
+  origin,
   povMode,
   routeCoords,
+  recenterTrigger,
 }: {
   isTracking: boolean;
   autoFollow: boolean;
   setAutoFollow: (val: boolean) => void;
   liveLocation: { lat: number; lon: number } | null;
-  povMode: 'DRIVER' | 'OVERVIEW';
+  origin: { lat: number; lon: number };
+  povMode: 'DRIVER_CLOSE' | 'DRIVER_FAR' | 'OVERVIEW';
   routeCoords: [number, number][];
+  recenterTrigger?: number;
 }) {
   const map = useMap();
+  const lastModeRef = useRef<string>('');
 
-  // ดักจับเมื่อผู้ใช้เอานิ้วเลื่อนแผนที่ด้วยตนเอง ให้หยุด auto-follow ชั่วคราว
+  // เมื่อผู้ใช้ลาก/เลื่อนแผนที่เอง ให้ปลด autoFollow ชั่วคราว
   useEffect(() => {
     const handleDragStart = () => {
       if (isTracking) {
@@ -274,87 +519,107 @@ function NavigationFollower({
     };
   }, [map, isTracking, setAutoFollow]);
 
-  // ซูมเปลี่ยน POV เมื่อเริ่มนำทาง หรือกดเปลี่ยนปุ่ม POV
+  // สลับโหมดมุมมอง หรือกดปุ่มดึงกลับมาที่ตัวเรา
   useEffect(() => {
-    if (!isTracking) return;
+    if (!isTracking) {
+      lastModeRef.current = '';
+      return;
+    }
 
-    if (povMode === 'DRIVER') {
-      if (liveLocation) {
-        map.flyTo([liveLocation.lat, liveLocation.lon], 17.5, {
+    const target = liveLocation || origin;
+
+    if (povMode === 'DRIVER_CLOSE') {
+      if (target) {
+        map.flyTo([target.lat, target.lon], 18, {
           animate: true,
-          duration: 1.0,
+          duration: 0.9,
         });
+        lastModeRef.current = 'DRIVER_CLOSE';
+      }
+    } else if (povMode === 'DRIVER_FAR') {
+      if (target) {
+        map.flyTo([target.lat, target.lon], 14, {
+          animate: true,
+          duration: 0.9,
+        });
+        lastModeRef.current = 'DRIVER_FAR';
       }
     } else if (povMode === 'OVERVIEW') {
+      lastModeRef.current = 'OVERVIEW';
       if (routeCoords && routeCoords.length > 0) {
         map.fitBounds(routeCoords, {
-          padding: [50, 50],
+          padding: [60, 60],
           maxZoom: 15,
           animate: true,
         });
       }
     }
-  }, [isTracking, povMode]);
+  }, [isTracking, povMode, recenterTrigger, map]);
 
-  // ติดตามตำแหน่งรถอย่างต่อเนื่องตามโหมด POV
+  // ติดตามการเคลื่อนที่สดของตำแหน่งตัวเรา (เมื่อ autoFollow เปิดอยู่)
   useEffect(() => {
-    if (isTracking && autoFollow && liveLocation) {
-      if (povMode === 'DRIVER') {
-        const currentZoom = map.getZoom();
-        if (currentZoom < 16) {
-          map.setView([liveLocation.lat, liveLocation.lon], 17.5, {
-            animate: true,
-            duration: 0.6,
-          });
-        } else {
-          map.panTo([liveLocation.lat, liveLocation.lon], {
-            animate: true,
-            duration: 0.8,
-            easeLinearity: 0.25,
-          });
-        }
+    if (!isTracking || !autoFollow) return;
+
+    const target = liveLocation || origin;
+    if (!target) return;
+
+    if (povMode === 'DRIVER_CLOSE') {
+      const currentZoom = map.getZoom();
+      if (lastModeRef.current !== 'DRIVER_CLOSE' || currentZoom < 16.5) {
+        map.flyTo([target.lat, target.lon], 18, { animate: true, duration: 0.8 });
+        lastModeRef.current = 'DRIVER_CLOSE';
+      } else {
+        map.panTo([target.lat, target.lon], { animate: true, duration: 0.4 });
+      }
+    } else if (povMode === 'DRIVER_FAR') {
+      const currentZoom = map.getZoom();
+      if (lastModeRef.current !== 'DRIVER_FAR' || Math.abs(currentZoom - 14) > 1.5) {
+        map.flyTo([target.lat, target.lon], 14, { animate: true, duration: 0.8 });
+        lastModeRef.current = 'DRIVER_FAR';
+      } else {
+        map.panTo([target.lat, target.lon], { animate: true, duration: 0.4 });
       }
     }
-  }, [isTracking, autoFollow, liveLocation?.lat, liveLocation?.lon, povMode, map]);
+  }, [isTracking, autoFollow, liveLocation?.lat, liveLocation?.lon, povMode, map, origin]);
 
   return null;
 }
 
-// ควบคุมมุมมองและการซูมของแผนที่ (Center, Fit Bounds และ Invalidate Size)
+function MapFlyController({ target }: { target: { lat: number; lon: number; zoom: number } | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (target) {
+      map.flyTo([target.lat, target.lon], target.zoom, { animate: true, duration: 1.2 });
+    }
+  }, [target]);
+  return null;
+}
+
 function MapController({
   origin,
   destination,
   routeCoords,
   isTracking,
 }: {
-  origin: { lat: number; lon: number } | null;
+  origin: { lat: number; lon: number };
   destination: { lat: number; lon: number } | null;
-  routeCoords: [number, number][];
-  isTracking: boolean;
+  routeCoords?: [number, number][];
+  isTracking?: boolean;
 }) {
   const map = useMap();
 
   useEffect(() => {
-    map.invalidateSize();
-    const timer = setTimeout(() => {
-      map.invalidateSize();
-    }, 250);
-    return () => clearTimeout(timer);
-  }, [map, isTracking]);
-
-  useEffect(() => {
-    // ถ้ากำลังอยู่ในโหมดติดตามหน้ารถสด จะปล่อยให้ NavigationFollower เป็นตัวคุมกล้อง
     if (isTracking) return;
 
     if (routeCoords && routeCoords.length > 0) {
-      map.fitBounds(routeCoords, { padding: [40, 40], maxZoom: 14 });
-    } else if (origin && destination && (origin.lat !== destination.lat || origin.lon !== destination.lon)) {
+      map.fitBounds(routeCoords, { padding: [70, 70], maxZoom: 15 });
+    } else if (origin && destination) {
       map.fitBounds(
         [
           [origin.lat, origin.lon],
           [destination.lat, destination.lon],
         ],
-        { padding: [50, 50], maxZoom: 14 }
+        { padding: [70, 70], maxZoom: 14 }
       );
     } else if (origin) {
       map.setView([origin.lat, origin.lon], 13);
@@ -368,32 +633,148 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<RouteAnalysis | null>(null);
 
-  // ตรวจจับขนาดหน้าจอ Mobile (ความกว้าง <= 768px ถือเป็นมือถือ)
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth <= 768);
-  const [isDrawerCollapsed, setIsDrawerCollapsed] = useState(false);
 
   useEffect(() => {
-    const handleResize = () => {
-      setIsMobile(window.innerWidth <= 768);
-    };
+    const handleResize = () => setIsMobile(window.innerWidth <= 768);
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // พิกัดเริ่มต้น: จตุจักร -> ฟิวเจอร์พาร์ครังสิต
   const [origin, setOrigin] = useState({ lat: 13.8027, lon: 100.5539 });
-  const [originName, setOriginName] = useState('BTS หมอชิต / จตุจักร');
+  const [originName, setOriginName] = useState('ตำแหน่งปัจจุบันของคุณ');
+  const [isGpsLoading, setIsGpsLoading] = useState(false);
 
-  const [destination, setDestination] = useState({ lat: 13.9892, lon: 100.6177 });
-  const [destinationName, setDestinationName] = useState('ฟิวเจอร์พาร์ค รังสิต');
+  useEffect(() => {
+    if (typeof window !== 'undefined' && navigator.geolocation) {
+      setIsGpsLoading(true);
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          const lat = Number(pos.coords.latitude.toFixed(6));
+          const lon = Number(pos.coords.longitude.toFixed(6));
+          setOrigin({ lat, lon });
+          setIsGpsLoading(false);
 
-  // แถบเลื่อนเวลาล่วงหน้า (Departure Time Slider) - หน่วยเป็นนาที (0 = ตอนนี้)
+          try {
+            const revUrl = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=16`;
+            const res = await fetch(revUrl, { headers: { 'Accept-Language': 'th,en' } });
+            const revData = await res.json();
+            if (revData && revData.display_name) {
+              const shortName = revData.display_name.split(',').slice(0, 3).join(', ');
+              setOriginName(shortName);
+            } else {
+              setOriginName('ตำแหน่งปัจจุบันของคุณ');
+            }
+          } catch {
+            setOriginName('ตำแหน่งปัจจุบันของคุณ');
+          }
+        },
+        (err) => {
+          console.warn('Auto geolocation error/skipped:', err?.message);
+          setIsGpsLoading(false);
+        },
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
+    }
+  }, []);
+
+  const [floodData, setFloodData] = useState<any>(null);
+  const [showFloodLayer, setShowFloodLayer] = useState<boolean>(true);
+  const [floodPeriod, setFloodPeriod] = useState<'1day' | '7days'>('7days');
+  const [isFloodLoading, setIsFloodLoading] = useState<boolean>(false);
+  const [showFloodMenu, setShowFloodMenu] = useState<boolean>(false);
+  const [mapFlyTarget, setMapFlyTarget] = useState<{ lat: number; lon: number; zoom: number } | null>(null);
+
+  const fetchFloodData = async (period: '1day' | '7days' = '1day') => {
+    setIsFloodLoading(true);
+    try {
+      if (period === '1day') {
+        const res1 = await fetch(
+          'https://api-gateway.gistda.or.th/api/2.0/resources/features/flood/1day?limit=1000&offset=0',
+          {
+            headers: {
+              accept: 'application/json',
+              'API-Key': 'iW8NtubTP0sqLeXaxMkvXZwvZJOIAnYJGf6ka1xc95LBz174Xu5dKwlrSKYx5j1b',
+            },
+          }
+        );
+        if (res1.ok) {
+          const json1 = await res1.json();
+          if (json1.features && json1.features.length > 0) {
+            setFloodData(json1);
+            setFloodPeriod('1day');
+            setIsFloodLoading(false);
+            return;
+          }
+        }
+      }
+
+      const targetEndpoint = period === '1day' ? '7days' : period;
+      const zones = [
+        { name: 'อยุธยาและปริมณฑล', bbox: '100.2,14.0,100.8,14.6', limit: 500 },
+        { name: 'ภาคกลางตอนบน', bbox: '99.5,14.6,101.5,15.6', limit: 600 },
+        { name: 'ภาคเหนือ', bbox: '98.0,15.6,101.5,20.5', limit: 800 },
+        { name: 'ภาคอีสาน', bbox: '101.5,14.0,105.8,18.5', limit: 800 },
+        { name: 'ภาคตะวันออกและใต้', bbox: '98.0,5.5,103.0,13.5', limit: 400 },
+      ];
+
+      const promises = zones.map((z) =>
+        fetch(
+          `https://api-gateway.gistda.or.th/api/2.0/resources/features/flood/${targetEndpoint}?bbox=${z.bbox}&limit=${z.limit}&offset=0`,
+          {
+            headers: {
+              accept: 'application/json',
+              'API-Key': 'iW8NtubTP0sqLeXaxMkvXZwvZJOIAnYJGf6ka1xc95LBz174Xu5dKwlrSKYx5j1b',
+            },
+          }
+        )
+          .then((r) => (r.ok ? r.json() : { features: [] }))
+          .catch(() => ({ features: [] }))
+      );
+
+      const results = await Promise.all(promises);
+      const allFeatures = results.flatMap((r) => r.features || []);
+
+      setFloodData({
+        type: 'FeatureCollection',
+        features: allFeatures,
+      });
+      setFloodPeriod(targetEndpoint as any);
+    } catch (err: any) {
+      console.warn('GISTDA Flood fetch warning:', err?.message);
+    } finally {
+      setIsFloodLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchFloodData('1day');
+  }, []);
+
+  const [destination, setDestination] = useState<{ lat: number; lon: number } | null>(null);
+  const [destinationName, setDestinationName] = useState<string>('');
   const [departureOffsetMin, setDepartureOffsetMin] = useState(0);
 
-  // ================= ระบบ Live Tracking & Navigation (Google Maps Style) =================
+  const [vehicleType, setVehicleType] = useState<'motorcycle' | 'car'>('motorcycle');
+  const [avoidTollways, setAvoidTollways] = useState<boolean>(true);
+  const [avoidHighways, setAvoidHighways] = useState<boolean>(true);
+  const [selectedRouteIndex, setSelectedRouteIndex] = useState<number>(0);
+
+  useEffect(() => {
+    (window as any).__selectRoute = (idx: number) => {
+      setSelectedRouteIndex(idx);
+    };
+    return () => {
+      delete (window as any).__selectRoute;
+    };
+  }, []);
+
+  const [activeSheet, setActiveSheet] = useState<'NONE' | 'LOCATIONS' | 'TIME' | 'AVOID' | 'SUMMARY'>('NONE');
+
   const [isTracking, setIsTracking] = useState(false);
   const [autoFollow, setAutoFollow] = useState(true);
-  const [povMode, setPovMode] = useState<'DRIVER' | 'OVERVIEW'>('DRIVER');
+  const [povMode, setPovMode] = useState<'DRIVER_CLOSE' | 'DRIVER_FAR' | 'OVERVIEW'>('DRIVER_CLOSE');
+  const [recenterTrigger, setRecenterTrigger] = useState(0);
   const [liveLocation, setLiveLocation] = useState<{
     lat: number;
     lon: number;
@@ -405,17 +786,20 @@ export function App() {
   const watchIdRef = useRef<number | null>(null);
   const prevLocationRef = useRef<{ lat: number; lon: number; heading: number | null } | null>(null);
 
-  // ฟังก์ชันเริ่ม / หยุดการติดตามตำแหน่ง GPS แบบ Real-time (watchPosition)
   const toggleTracking = () => {
     if (isTracking) {
-      // หยุดติดตาม
       if (watchIdRef.current !== null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
         watchIdRef.current = null;
       }
       setIsTracking(false);
     } else {
-      // เริ่มดักจับตำแหน่งสด
+      if (!destination) {
+        setActiveSheet('LOCATIONS');
+        alert('กรุณาเลือกจุดหมายปลายทางก่อนเริ่มเดินทางครับ');
+        return;
+      }
+
       if (!navigator.geolocation) {
         alert('เบราว์เซอร์ของคุณไม่รองรับการดักจับตำแหน่ง GPS แบบ Real-time');
         return;
@@ -423,12 +807,10 @@ export function App() {
 
       setIsTracking(true);
       setAutoFollow(true);
-      setPovMode('DRIVER');
-      if (isMobile) {
-        setIsDrawerCollapsed(true);
-      }
+      setPovMode('DRIVER_CLOSE');
+      setRecenterTrigger((c) => c + 1);
+      setActiveSheet('NONE');
 
-      // ถ้ายังไม่มีข้อมูลเส้นทาง ให้สแกนเส้นทางให้อัตโนมัติ
       if (!data) {
         handleCheckRain();
       }
@@ -438,7 +820,6 @@ export function App() {
           const { latitude, longitude, heading, speed, accuracy } = pos.coords;
           let calculatedHeading = heading;
 
-          // กรณีที่เครื่องอยู่กับที่หรือไม่ได้ค่า heading จากเซ็นเซอร์ ให้คำนวณมุม Bearing จากพิกัดเดิม
           if ((calculatedHeading === null || isNaN(calculatedHeading)) && prevLocationRef.current) {
             const dLat = Math.abs(latitude - prevLocationRef.current.lat);
             const dLon = Math.abs(longitude - prevLocationRef.current.lon);
@@ -454,22 +835,26 @@ export function App() {
             }
           }
 
-          const speedKmh = speed !== null && !isNaN(speed) && speed > 0 ? Math.round(speed * 3.6) : null;
+          if ((calculatedHeading === null || isNaN(calculatedHeading)) && data?.routes?.[selectedRouteIndex]?.geometry?.coordinates) {
+            const coords = data.routes[selectedRouteIndex].geometry.coordinates;
+            if (coords && coords.length >= 2) {
+              calculatedHeading = calculateBearing(coords[0][1], coords[0][0], coords[1][1], coords[1][0]);
+            }
+          }
 
-          const updated = {
+          const speedKmh = speed !== null && !isNaN(speed) ? Math.round(speed * 3.6) : 0;
+
+          setLiveLocation({
             lat: latitude,
             lon: longitude,
             heading: calculatedHeading,
             speed: speedKmh,
             accuracy: Math.round(accuracy),
-          };
+          });
 
-          prevLocationRef.current = updated;
-          setLiveLocation(updated);
-
-          // อัปเดตจุดเริ่มต้นตามตำแหน่งปัจจุบันอัตโนมัติ
+          prevLocationRef.current = { lat: latitude, lon: longitude, heading: calculatedHeading };
           setOrigin({ lat: latitude, lon: longitude });
-          setOriginName('📍 ตำแหน่งสดของคุณ (Live GPS)');
+          setOriginName('ตำแหน่งสดของคุณ (Live GPS)');
         },
         (err) => {
           console.warn('watchPosition error:', err);
@@ -483,7 +868,6 @@ export function App() {
     }
   };
 
-  // เคลียร์ watchPosition เมื่อออกจากหน้าเว็บ
   useEffect(() => {
     return () => {
       if (watchIdRef.current !== null) {
@@ -492,98 +876,49 @@ export function App() {
     };
   }, []);
 
-  // สถานะ Geocoding Search
   const [originSuggestions, setOriginSuggestions] = useState<PlaceSuggestion[]>([]);
   const [destSuggestions, setDestSuggestions] = useState<PlaceSuggestion[]>([]);
-  const [isSearchingOrigin, setIsSearchingOrigin] = useState(false);
-  const [isSearchingDest, setIsSearchingDest] = useState(false);
   const [showOriginDropdown, setShowOriginDropdown] = useState(false);
   const [showDestDropdown, setShowDestDropdown] = useState(false);
-
-  // สถานะ GPS สำหรับกดครั้งเดียว
-  const [isGpsLoading, setIsGpsLoading] = useState(false);
-  const [showManualCoords, setShowManualCoords] = useState(false);
-
   const originInputRef = useRef<HTMLDivElement>(null);
   const destInputRef = useRef<HTMLDivElement>(null);
 
-  // คำนวณข้อความเวลาออกเดินทาง เช่น "ตอนนี้ (21:05 น.)"
-  const getDepartureTimeLabel = (offsetMinutes: number) => {
-    const targetDate = new Date(Date.now() + offsetMinutes * 60 * 1000);
-    const timeStr = `${String(targetDate.getHours()).padStart(2, '0')}:${String(targetDate.getMinutes()).padStart(2, '0')}`;
-
-    if (offsetMinutes === 0) {
-      return `ตอนนี้ (${timeStr} น.)`;
+  useEffect(() => {
+    if (!originName || originName.length < 2) {
+      setOriginSuggestions([]);
+      return;
     }
+    const timer = setTimeout(async () => {
+      try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+          originName
+        )}&countrycodes=th&limit=5&addressdetails=1`;
+        const res = await fetch(url, { headers: { 'Accept-Language': 'th,en' } });
+        const json = await res.json();
+        setOriginSuggestions(json || []);
+      } catch {}
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [originName]);
 
-    const hours = Math.floor(offsetMinutes / 60);
-    const mins = offsetMinutes % 60;
-    let offsetStr = 'อีก ';
-    if (hours > 0) offsetStr += `${hours} ชม. `;
-    if (mins > 0) offsetStr += `${mins} นาที `;
-    return `${offsetStr}(${timeStr} น.)`;
-  };
-
-  // ค้นหาสถานที่ผ่าน Nominatim OpenStreetMap
-  const searchPlaces = async (query: string): Promise<PlaceSuggestion[]> => {
-    if (!query || query.trim().length < 2) return [];
-    try {
-      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
-        query.trim()
-      )}&limit=5&countrycodes=th&addressdetails=1`;
-      const res = await fetch(url, {
-        headers: { 'Accept-Language': 'th,en' },
-      });
-      if (!res.ok) return [];
-      return await res.json();
-    } catch {
-      return [];
+  useEffect(() => {
+    if (!destinationName || destinationName.length < 2) {
+      setDestSuggestions([]);
+      return;
     }
-  };
-
-  // Debounced Search Origin
-  useEffect(() => {
-    if (!showOriginDropdown) return;
     const timer = setTimeout(async () => {
-      if (originName && originName.length >= 2 && !originName.startsWith('📍')) {
-        setIsSearchingOrigin(true);
-        const results = await searchPlaces(originName);
-        setOriginSuggestions(results);
-        setIsSearchingOrigin(false);
-      }
-    }, 450);
+      try {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+          destinationName
+        )}&countrycodes=th&limit=5&addressdetails=1`;
+        const res = await fetch(url, { headers: { 'Accept-Language': 'th,en' } });
+        const json = await res.json();
+        setDestSuggestions(json || []);
+      } catch {}
+    }, 400);
     return () => clearTimeout(timer);
-  }, [originName, showOriginDropdown]);
+  }, [destinationName]);
 
-  // Debounced Search Destination
-  useEffect(() => {
-    if (!showDestDropdown) return;
-    const timer = setTimeout(async () => {
-      if (destinationName && destinationName.length >= 2) {
-        setIsSearchingDest(true);
-        const results = await searchPlaces(destinationName);
-        setDestSuggestions(results);
-        setIsSearchingDest(false);
-      }
-    }, 450);
-    return () => clearTimeout(timer);
-  }, [destinationName, showDestDropdown]);
-
-  // คลิกนอก Dropdown เพื่อปิด
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (originInputRef.current && !originInputRef.current.contains(e.target as Node)) {
-        setShowOriginDropdown(false);
-      }
-      if (destInputRef.current && !destInputRef.current.contains(e.target as Node)) {
-        setShowDestDropdown(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
-
-  // ดึงพิกัดปัจจุบันครั้งเดียวด้วย getCurrentPosition
   const handleGetCurrentLocation = () => {
     if (!navigator.geolocation) {
       alert('เบราว์เซอร์ของคุณไม่รองรับการระบุตำแหน่ง GPS');
@@ -596,7 +931,7 @@ export function App() {
         const lat = Number(pos.coords.latitude.toFixed(6));
         const lon = Number(pos.coords.longitude.toFixed(6));
         setOrigin({ lat, lon });
-        setOriginName('📍 ตำแหน่งปัจจุบันของคุณ');
+        setOriginName('ตำแหน่งปัจจุบันของคุณ');
         setShowOriginDropdown(false);
         setIsGpsLoading(false);
 
@@ -606,47 +941,20 @@ export function App() {
           const revData = await res.json();
           if (revData && revData.display_name) {
             const shortName = revData.display_name.split(',').slice(0, 3).join(', ');
-            setOriginName(`📍 ${shortName}`);
+            setOriginName(shortName);
           }
-        } catch {
-          // fallback
-        }
+        } catch {}
       },
       (err) => {
         setIsGpsLoading(false);
-        let errorMsg = 'ไม่สามารถดึงตำแหน่งปัจจุบันได้';
-        if (err.code === err.PERMISSION_DENIED) {
-          errorMsg = 'กรุณาอนุญาต Location Permission ในเบราว์เซอร์เพื่อใช้งาน GPS';
-        } else if (err.code === err.POSITION_UNAVAILABLE) {
-          errorMsg = 'สัญญาณ GPS ไม่พร้อมใช้งาน';
-        } else if (err.code === err.TIMEOUT) {
-          errorMsg = 'หมดเวลารอพิกัด GPS กรุณาลองใหม่อีกครั้ง';
-        }
-        alert(errorMsg);
+        alert('ไม่สามารถดึงตำแหน่งปัจจุบันได้: ' + err.message);
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 10000 }
     );
   };
 
-  const handleSelectOrigin = (item: PlaceSuggestion) => {
-    const lat = parseFloat(item.lat);
-    const lon = parseFloat(item.lon);
-    setOrigin({ lat, lon });
-    const shortName = item.display_name.split(',').slice(0, 3).join(', ');
-    setOriginName(shortName);
-    setShowOriginDropdown(false);
-  };
-
-  const handleSelectDestination = (item: PlaceSuggestion) => {
-    const lat = parseFloat(item.lat);
-    const lon = parseFloat(item.lon);
-    setDestination({ lat, lon });
-    const shortName = item.display_name.split(',').slice(0, 3).join(', ');
-    setDestinationName(shortName);
-    setShowDestDropdown(false);
-  };
-
   const handleSwapLocations = () => {
+    if (!destination) return;
     const tempOrigin = { ...origin };
     const tempOriginName = originName;
     setOrigin(destination);
@@ -655,25 +963,51 @@ export function App() {
     setDestinationName(tempOriginName);
   };
 
-  // ยิง API ตรวจสอบเส้นทางพร้อมเวลาออกเดินทาง (มีระบบ Fallback ไปวิเคราะห์ตรงจากเบราว์เซอร์อัตโนมัติ)
-  const handleCheckRain = async () => {
+  const getDepartureTimeLabel = (offsetMinutes: number) => {
+    const targetDate = new Date(Date.now() + offsetMinutes * 60 * 1000);
+    const timeStr = `${String(targetDate.getHours()).padStart(2, '0')}:${String(targetDate.getMinutes()).padStart(2, '0')} น.`;
+    if (offsetMinutes === 0) return `ตอนนี้ (${timeStr})`;
+    const hrs = Math.floor(offsetMinutes / 60);
+    const mins = offsetMinutes % 60;
+    const durStr = hrs > 0 ? (mins > 0 ? `+${hrs} ชม. ${mins} นาที` : `+${hrs} ชม.`) : `+${mins} นาที`;
+    return `${durStr} (${timeStr})`;
+  };
+
+  const handleCheckRain = async (
+    targetVehicle?: 'motorcycle' | 'car',
+    targetAvoidTollways?: boolean,
+    targetAvoidHighways?: boolean,
+    customDestination?: { lat: number; lon: number; name?: string }
+  ) => {
+    const targetDest = customDestination ? { lat: customDestination.lat, lon: customDestination.lon } : destination;
+    if (!targetDest) {
+      setActiveSheet('LOCATIONS');
+      return;
+    }
+
+    const activeVehicle = targetVehicle ?? vehicleType;
+    const activeAvoidTollways = targetAvoidTollways ?? avoidTollways;
+    const activeAvoidHighways = targetAvoidHighways ?? avoidHighways;
     setLoading(true);
+    setSelectedRouteIndex(0);
     try {
       let resultData: RouteAnalysis | null = null;
 
-      // 1. ลองเชื่อมต่อ API บน Render ก่อน (ตั้ง Timeout 6 วินาที ป้องกันกรณี Render กำลังหลับ Cold Start)
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000);
+        const timeoutId = setTimeout(() => controller.abort(), 3500);
 
         const res = await fetch('https://rain-radar.onrender.com/api/analyze-route', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             origin,
-            destination,
+            destination: targetDest,
             sampleIntervalKm: 4,
             departureOffsetMin,
+            vehicleType: activeVehicle,
+            avoidHighways: activeAvoidHighways,
+            avoidTollways: activeAvoidTollways,
           }),
           signal: controller.signal,
         });
@@ -681,32 +1015,40 @@ export function App() {
 
         if (res.ok) {
           const json = await res.json();
-          if (json.status === 'success' && json.data) {
+          if (json.status === 'success' && json.data && json.data.summary?.vehicleType === activeVehicle) {
             resultData = json.data;
-          } else {
-            console.warn('Render API returned non-success (e.g. 429 Rate Limit):', json.message);
           }
-        } else {
-          console.warn(`Render API returned HTTP status ${res.status}`);
         }
       } catch (backendErr: any) {
         console.warn('Render API connection skipped/timeout:', backendErr.message);
       }
 
-      // 2. ถ้า Render ติด 429 Rate Limit หรือเซิร์ฟเวอร์หลับ ให้สลับมาวิเคราะห์ในเบราว์เซอร์ผู้ใช้ทันที (Client-Side Fallback)
       if (!resultData) {
-        resultData = await analyzeRouteClientSide(origin, destination, 4, departureOffsetMin);
+        resultData = await analyzeRouteClientSide({
+          origin,
+          destination: targetDest,
+          sampleIntervalKm: 4,
+          departureOffsetMin,
+          vehicleType: activeVehicle,
+          avoidHighways: activeAvoidHighways,
+          avoidTollways: activeAvoidTollways,
+        });
       }
 
       setData(resultData);
-      if (isMobile) {
-        setIsDrawerCollapsed(true);
-      }
+      setActiveSheet('NONE');
     } catch (err: any) {
       alert('ไม่สามารถตรวจสอบเส้นทางได้: ' + (err?.message || 'เกิดข้อผิดพลาดในการดึงข้อมูล'));
     } finally {
       setLoading(false);
     }
+  };
+
+  const selectQuickDestination = (dest: { name: string; lat: number; lon: number }) => {
+    setDestination({ lat: dest.lat, lon: dest.lon });
+    setDestinationName(dest.name);
+    setShowDestDropdown(false);
+    handleCheckRain(vehicleType, avoidTollways, avoidHighways, { lat: dest.lat, lon: dest.lon, name: dest.name });
   };
 
   const getStatusColor = (status: string) => {
@@ -716,755 +1058,81 @@ export function App() {
   };
 
   const getStatusText = (status: string) => {
-    if (status === 'DANGER') return 'เสี่ยงฝนตก 🌧️';
-    if (status === 'WARNING') return 'ระวังละอองฝน 🌦️';
-    return 'ถนนแห้ง ปลอดภัย ☀️';
+    if (status === 'DANGER') return 'เสี่ยงฝนตก';
+    if (status === 'WARNING') return 'ระวังละอองฝน';
+    return 'ถนนแห้ง ปลอดภัย';
   };
 
+  const activeRoute = (data?.routes && data.routes[selectedRouteIndex]) ? data.routes[selectedRouteIndex] : (data ? {
+    id: 0,
+    name: 'เส้นทางหลัก',
+    distanceKm: data.summary.totalDistanceKm,
+    durationMin: data.summary.totalDurationMin,
+    durationFormatted: data.summary.durationFormatted || formatDuration(data.summary.totalDurationMin),
+    hasTollway: Boolean(data.summary.hasTollway),
+    tollDistanceKm: data.summary.tollDistanceKm || '0',
+    status: data.summary.status,
+    maxRainProbability: data.summary.maxRainProbability,
+    rainPointsCount: data.summary.rainPointsCount,
+    recommendation: data.summary.recommendation,
+    geometry: data.routeGeometry,
+    coordinates: [],
+    checkpoints: data.checkpoints,
+    routingProvider: data.summary.routingProvider,
+  } : null);
+
   const polylinePositions =
-    data?.routeGeometry?.coordinates.map(([lon, lat]) => [lat, lon] as [number, number]) || [];
+    activeRoute?.geometry?.coordinates.map(([lon, lat]: [number, number]) => [lat, lon] as [number, number]) || [];
 
   return (
     <div
       style={{
-        display: 'flex',
-        flexDirection: isMobile ? 'column' : 'row',
+        position: 'relative',
         height: '100vh',
         width: '100vw',
-        position: 'relative',
         overflow: 'hidden',
-        backgroundColor: '#ffffff',
-        fontFamily: 'system-ui, -apple-system, sans-serif',
+        backgroundColor: '#f8fafc',
+        fontFamily: "'Prompt', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
       }}
     >
-      {/* ================= แผงควบคุม (เมื่อเริ่มนำทางจะซ่อนกล่องนี้ทิ้งเพื่อให้เห็นแต่เรากับแมพ) ================= */}
-      {!isTracking && (
-        <div
-          style={
-            isMobile
-              ? {
-                  position: 'absolute',
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  zIndex: 1000,
-                  backgroundColor: '#ffffff',
-                  borderTopLeftRadius: '22px',
-                  borderTopRightRadius: '22px',
-                  boxShadow: '0 -8px 30px rgba(0,0,0,0.22)',
-                  maxHeight: isDrawerCollapsed ? '76px' : '82vh',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  overflow: 'hidden',
-                  transition: 'max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
-                }
-              : {
-                  width: '420px',
-                  minWidth: '390px',
-                  height: '100vh',
-                  borderRight: '1px solid #e2e8f0',
-                  boxSizing: 'border-box',
-                  backgroundColor: '#ffffff',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  boxShadow: '2px 0 12px rgba(0,0,0,0.06)',
-                  zIndex: 10,
-                  overflow: 'hidden',
-                }
-          }
-        >
-        {/* Mobile Header / Grab Handle */}
-        {isMobile && (
-          <div
-            onClick={() => setIsDrawerCollapsed(!isDrawerCollapsed)}
-            style={{
-              padding: '10px 16px 8px 16px',
-              cursor: 'pointer',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              userSelect: 'none',
-              borderBottom: isDrawerCollapsed ? 'none' : '1px solid #f1f5f9',
-            }}
-          >
-            <div
-              style={{
-                width: '40px',
-                height: '5px',
-                backgroundColor: '#cbd5e1',
-                borderRadius: '3px',
-                marginBottom: '8px',
-              }}
-            />
-
-            {/* แถบสรุปด่วนสำหรับดูบนที่จับมือถือหน้ารถ (เมื่อย่อลง) */}
-            {isDrawerCollapsed && (
-              <div
-                style={{
-                  width: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: '8px',
-                }}
-              >
-                {data ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: 0 }}>
-                    <span
-                      style={{
-                        backgroundColor: getStatusColor(data.summary.status),
-                        color: 'white',
-                        padding: '4px 10px',
-                        borderRadius: '14px',
-                        fontSize: '0.82rem',
-                        fontWeight: 700,
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {getStatusText(data.summary.status)}
-                    </span>
-                    <span style={{ fontSize: '0.82rem', color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {data.summary.departureTime ? `🕒 ${data.summary.departureTime} น. • ` : ''}
-                      {data.summary.totalDistanceKm} กม. • ฝน {data.summary.maxRainProbability}%
-                    </span>
-                  </div>
-                ) : (
-                  <div style={{ fontSize: '0.85rem', color: '#64748b', fontWeight: 600 }}>
-                    {isTracking ? '🟢 กำลังติดตามรถแบบสด' : '🏍️ แตะเพื่อเปิดแผงเลือกเส้นทาง'}
-                  </div>
-                )}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setIsDrawerCollapsed(false);
-                  }}
-                  style={{
-                    backgroundColor: '#eff6ff',
-                    color: '#2563eb',
-                    border: '1px solid #bfdbfe',
-                    borderRadius: '8px',
-                    padding: '6px 12px',
-                    fontSize: '0.8rem',
-                    fontWeight: 700,
-                    cursor: 'pointer',
-                  }}
-                >
-                  ⚙️ ตั้งค่า
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* เนื้อหาฟอร์มและผลการวิเคราะห์ */}
-        {(!isMobile || !isDrawerCollapsed) && (
-          <>
-            <div
-              style={{
-                flex: '1 1 0%',
-                minHeight: 0,
-                padding: isMobile ? '12px 18px 20px 18px' : '0',
-                overflowY: 'auto',
-                WebkitOverflowScrolling: 'touch',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '14px',
-              }}
-            >
-            {/* หัวข้อ */}
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '1.5rem' }}>🏍️</span>
-                <div>
-                  <h2 style={{ fontSize: '1.25rem', fontWeight: 800, margin: 0, color: '#0f172a' }}>
-                    Moto Rain Radar
-                  </h2>
-                  <div style={{ fontSize: '0.72rem', color: '#64748b' }}>เรดาร์ฝนสำหรับมอเตอร์ไซค์ (PWA)</div>
-                </div>
-              </div>
-              {isMobile && (
-                <button
-                  onClick={() => setIsDrawerCollapsed(true)}
-                  style={{
-                    backgroundColor: '#f1f5f9',
-                    border: 'none',
-                    borderRadius: '50%',
-                    width: '32px',
-                    height: '32px',
-                    cursor: 'pointer',
-                    fontSize: '0.9rem',
-                    color: '#64748b',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                  title="ย่อลงเพื่อดูแผนที่"
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-
-            {/* แถบเปิด/ปิดระบบนำทางสด (Live Navigation GPS) */}
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '10px 14px',
-                borderRadius: '12px',
-                backgroundColor: isTracking ? '#ecfdf5' : '#f8fafc',
-                border: `1.5px solid ${isTracking ? '#10b981' : '#e2e8f0'}`,
-                transition: 'all 0.2s ease',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ fontSize: '1.3rem' }}>🧭</span>
-                <div>
-                  <div style={{ fontSize: '0.88rem', fontWeight: 700, color: isTracking ? '#047857' : '#1e293b' }}>
-                    {isTracking ? 'โหมดนำทางสด (Live GPS)' : 'ติดตามการเคลื่อนที่แบบสด'}
-                  </div>
-                  <div style={{ fontSize: '0.72rem', color: '#64748b' }}>
-                    {isTracking
-                      ? `หมุนตามหน้ารถอัตโนมัติ${liveLocation && liveLocation.speed ? ` • ${liveLocation.speed} กม./ชม.` : ''}`
-                      : 'เหมือน Google Maps วิ่งตามตำแหน่งรถ'}
-                  </div>
-                </div>
-              </div>
-              <button
-                onClick={toggleTracking}
-                style={{
-                  padding: '7px 14px',
-                  borderRadius: '20px',
-                  border: 'none',
-                  fontSize: '0.82rem',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                  backgroundColor: isTracking ? '#ef4444' : '#2563eb',
-                  color: 'white',
-                  boxShadow: isTracking
-                    ? '0 2px 8px rgba(239,68,68,0.3)'
-                    : '0 2px 8px rgba(37,99,235,0.3)',
-                }}
-              >
-                {isTracking ? '🛑 หยุด' : '▶️ เริ่มนำทาง'}
-              </button>
-            </div>
-
-            {/* ช่องจุดเริ่มต้น */}
-            <div ref={originInputRef} style={{ position: 'relative' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                <label style={{ fontSize: '0.85rem', color: '#334155', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#10b981' }}></span>
-                  จุดเริ่มต้น
-                </label>
-                <button
-                  onClick={handleGetCurrentLocation}
-                  disabled={isGpsLoading}
-                  style={{
-                    fontSize: '0.8rem',
-                    backgroundColor: isGpsLoading ? '#94a3b8' : '#ecfdf5',
-                    color: isGpsLoading ? '#ffffff' : '#047857',
-                    border: '1px solid #a7f3d0',
-                    borderRadius: '8px',
-                    padding: '6px 12px',
-                    cursor: isGpsLoading ? 'not-allowed' : 'pointer',
-                    fontWeight: 700,
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                  }}
-                  title="ใช้ตำแหน่งปัจจุบันจาก GPS"
-                >
-                  {isGpsLoading ? '⏳ กำลังหา...' : '📍 ตำแหน่งปัจจุบัน'}
-                </button>
-              </div>
-
-              <div style={{ position: 'relative' }}>
-                <input
-                  type="text"
-                  placeholder="พิมพ์ชื่อสถานที่ เช่น BTS หมอชิต..."
-                  value={originName}
-                  onChange={(e) => {
-                    setOriginName(e.target.value);
-                    setShowOriginDropdown(true);
-                  }}
-                  onFocus={() => setShowOriginDropdown(true)}
-                  style={{
-                    width: '100%',
-                    padding: '11px 36px 11px 12px',
-                    border: '1.5px solid #cbd5e1',
-                    borderRadius: '10px',
-                    fontSize: '0.95rem',
-                    boxSizing: 'border-box',
-                    outline: 'none',
-                  }}
-                />
-                {originName && (
-                  <button
-                    onClick={() => {
-                      setOriginName('');
-                      setOriginSuggestions([]);
-                    }}
-                    style={{
-                      position: 'absolute',
-                      right: '10px',
-                      top: '50%',
-                      transform: 'translateY(-50%)',
-                      background: 'transparent',
-                      border: 'none',
-                      color: '#94a3b8',
-                      cursor: 'pointer',
-                      fontSize: '1rem',
-                      padding: '4px',
-                    }}
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
-
-              {/* Dropdown ผลค้นหา Origin */}
-              {showOriginDropdown && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: '100%',
-                    left: 0,
-                    right: 0,
-                    backgroundColor: 'white',
-                    border: '1px solid #e2e8f0',
-                    borderRadius: '10px',
-                    boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
-                    marginTop: '4px',
-                    zIndex: 1100,
-                    maxHeight: '200px',
-                    overflowY: 'auto',
-                  }}
-                >
-                  {isSearchingOrigin && (
-                    <div style={{ padding: '10px', fontSize: '0.85rem', color: '#64748b', textAlign: 'center' }}>
-                      🔍 กำลังค้นหา...
-                    </div>
-                  )}
-                  {!isSearchingOrigin && originSuggestions.length === 0 && originName.length >= 2 && (
-                    <div style={{ padding: '10px', fontSize: '0.85rem', color: '#94a3b8', textAlign: 'center' }}>
-                      ไม่พบสถานที่ ลองพิมพ์ชื่อให้ชัดเจนขึ้น
-                    </div>
-                  )}
-                  {originSuggestions.map((item) => (
-                    <div
-                      key={item.place_id}
-                      onClick={() => handleSelectOrigin(item)}
-                      style={{
-                        padding: '10px 12px',
-                        cursor: 'pointer',
-                        fontSize: '0.88rem',
-                        borderBottom: '1px solid #f1f5f9',
-                        lineHeight: '1.3',
-                      }}
-                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#f8fafc')}
-                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                    >
-                      <div style={{ fontWeight: 600, color: '#0f172a' }}>
-                        📍 {item.display_name.split(',')[0]}
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {item.display_name}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* ปุ่มสลับต้นทาง-ปลายทาง */}
-            <div style={{ display: 'flex', justifyContent: 'center' }}>
-              <button
-                onClick={handleSwapLocations}
-                style={{
-                  padding: '5px 14px',
-                  backgroundColor: '#f8fafc',
-                  border: '1px solid #cbd5e1',
-                  borderRadius: '20px',
-                  fontSize: '0.82rem',
-                  fontWeight: 600,
-                  color: '#475569',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                }}
-              >
-                ⇅ สลับจุดเริ่มต้นและปลายทาง
-              </button>
-            </div>
-
-            {/* ช่องจุดปลายทาง */}
-            <div ref={destInputRef} style={{ position: 'relative' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
-                <label style={{ fontSize: '0.85rem', color: '#334155', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#ef4444' }}></span>
-                  จุดปลายทาง
-                </label>
-              </div>
-
-              <div style={{ position: 'relative' }}>
-                <input
-                  type="text"
-                  placeholder="พิมพ์ชื่อสถานที่ เช่น ฟิวเจอร์พาร์ค..."
-                  value={destinationName}
-                  onChange={(e) => {
-                    setDestinationName(e.target.value);
-                    setShowDestDropdown(true);
-                  }}
-                  onFocus={() => setShowDestDropdown(true)}
-                  style={{
-                    width: '100%',
-                    padding: '11px 36px 11px 12px',
-                    border: '1.5px solid #cbd5e1',
-                    borderRadius: '10px',
-                    fontSize: '0.95rem',
-                    boxSizing: 'border-box',
-                    outline: 'none',
-                  }}
-                />
-                {destinationName && (
-                  <button
-                    onClick={() => {
-                      setDestinationName('');
-                      setDestSuggestions([]);
-                    }}
-                    style={{
-                      position: 'absolute',
-                      right: '10px',
-                      top: '50%',
-                      transform: 'translateY(-50%)',
-                      background: 'transparent',
-                      border: 'none',
-                      color: '#94a3b8',
-                      cursor: 'pointer',
-                      fontSize: '1rem',
-                      padding: '4px',
-                    }}
-                  >
-                    ✕
-                  </button>
-                )}
-              </div>
-
-              {/* Dropdown ผลค้นหา Destination */}
-              {showDestDropdown && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: '100%',
-                    left: 0,
-                    right: 0,
-                    backgroundColor: 'white',
-                    border: '1px solid #e2e8f0',
-                    borderRadius: '10px',
-                    boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
-                    marginTop: '4px',
-                    zIndex: 1100,
-                    maxHeight: '200px',
-                    overflowY: 'auto',
-                  }}
-                >
-                  {isSearchingDest && (
-                    <div style={{ padding: '10px', fontSize: '0.85rem', color: '#64748b', textAlign: 'center' }}>
-                      🔍 กำลังค้นหา...
-                    </div>
-                  )}
-                  {!isSearchingDest && destSuggestions.length === 0 && destinationName.length >= 2 && (
-                    <div style={{ padding: '10px', fontSize: '0.85rem', color: '#94a3b8', textAlign: 'center' }}>
-                      ไม่พบสถานที่ ลองพิมพ์ชื่อให้ชัดเจนขึ้น
-                    </div>
-                  )}
-                  {destSuggestions.map((item) => (
-                    <div
-                      key={item.place_id}
-                      onClick={() => handleSelectDestination(item)}
-                      style={{
-                        padding: '10px 12px',
-                        cursor: 'pointer',
-                        fontSize: '0.88rem',
-                        borderBottom: '1px solid #f1f5f9',
-                        lineHeight: '1.3',
-                      }}
-                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#f8fafc')}
-                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                    >
-                      <div style={{ fontWeight: 600, color: '#0f172a' }}>
-                        📍 {item.display_name.split(',')[0]}
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {item.display_name}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* แถบเลื่อนเวลาล่วงหน้า (Departure Time Slider) */}
-            <div
-              style={{
-                backgroundColor: '#f8fafc',
-                borderRadius: '12px',
-                padding: '12px 14px',
-                border: '1px solid #e2e8f0',
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                <label style={{ fontSize: '0.85rem', fontWeight: 700, color: '#334155', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <span>🕒</span> เวลาออกเดินทาง:
-                </label>
-                <span
-                  style={{
-                    fontSize: '0.82rem',
-                    fontWeight: 700,
-                    color: departureOffsetMin === 0 ? '#2563eb' : '#d97706',
-                    backgroundColor: departureOffsetMin === 0 ? '#eff6ff' : '#fef3c7',
-                    padding: '3px 8px',
-                    borderRadius: '10px',
-                  }}
-                >
-                  {getDepartureTimeLabel(departureOffsetMin)}
-                </span>
-              </div>
-
-              {/* ปุ่มลัดเลือกเวลา */}
-              <div style={{ display: 'flex', gap: '6px', marginBottom: '10px', flexWrap: 'wrap' }}>
-                {[
-                  { label: 'ตอนนี้', value: 0 },
-                  { label: '+30 นาที', value: 30 },
-                  { label: '+1 ชม.', value: 60 },
-                  { label: '+2 ชม.', value: 120 },
-                  { label: '+3 ชม.', value: 180 },
-                ].map((preset) => (
-                  <button
-                    key={preset.value}
-                    onClick={() => setDepartureOffsetMin(preset.value)}
-                    style={{
-                      flex: 1,
-                      padding: '6px 4px',
-                      fontSize: '0.76rem',
-                      fontWeight: 700,
-                      borderRadius: '8px',
-                      border: '1px solid',
-                      borderColor: departureOffsetMin === preset.value ? '#2563eb' : '#cbd5e1',
-                      backgroundColor: departureOffsetMin === preset.value ? '#2563eb' : '#ffffff',
-                      color: departureOffsetMin === preset.value ? '#ffffff' : '#475569',
-                      cursor: 'pointer',
-                      transition: 'all 0.15s ease',
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-
-              {/* แถบ Slider เลือกเวลาละเอียด (0 ถึง 360 นาที = 6 ชม.) */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <span style={{ fontSize: '0.72rem', color: '#64748b', fontWeight: 600 }}>ตอนนี้</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={360}
-                  step={15}
-                  value={departureOffsetMin}
-                  onChange={(e) => setDepartureOffsetMin(parseInt(e.target.value, 10))}
-                  style={{
-                    flex: 1,
-                    height: '6px',
-                    borderRadius: '4px',
-                    accentColor: '#2563eb',
-                    cursor: 'pointer',
-                  }}
-                />
-                <span style={{ fontSize: '0.72rem', color: '#64748b', fontWeight: 600 }}>+6 ชม.</span>
-              </div>
-            </div>
-
-            {/* Toggle ดูพิกัดตัวเลข */}
-            <div>
-              <button
-                onClick={() => setShowManualCoords(!showManualCoords)}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: '#64748b',
-                  fontSize: '0.78rem',
-                  cursor: 'pointer',
-                  padding: 0,
-                  textDecoration: 'underline',
-                }}
-              >
-                {showManualCoords ? 'ซ่อนพิกัดตัวเลข' : '⚙️ ดู / ปรับตัวเลขพิกัด Lat, Lon'}
-              </button>
-
-              {showManualCoords && (
-                <div style={{ marginTop: '8px', padding: '10px', backgroundColor: '#f8fafc', borderRadius: '8px', fontSize: '0.82rem' }}>
-                  <div style={{ marginBottom: '6px' }}>
-                    <span style={{ fontWeight: 600, color: '#047857' }}>ต้นทาง:</span> {origin.lat.toFixed(4)}, {origin.lon.toFixed(4)}
-                    <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
-                      <input
-                        type="number"
-                        step="any"
-                        value={origin.lat}
-                        onChange={(e) => setOrigin({ ...origin, lat: parseFloat(e.target.value) || 0 })}
-                        style={{ width: '50%', padding: '5px', border: '1px solid #cbd5e1', borderRadius: '4px' }}
-                      />
-                      <input
-                        type="number"
-                        step="any"
-                        value={origin.lon}
-                        onChange={(e) => setOrigin({ ...origin, lon: parseFloat(e.target.value) || 0 })}
-                        style={{ width: '50%', padding: '5px', border: '1px solid #cbd5e1', borderRadius: '4px' }}
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <span style={{ fontWeight: 600, color: '#b91c1c' }}>ปลายทาง:</span> {destination.lat.toFixed(4)}, {destination.lon.toFixed(4)}
-                    <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
-                      <input
-                        type="number"
-                        step="any"
-                        value={destination.lat}
-                        onChange={(e) => setDestination({ ...destination, lat: parseFloat(e.target.value) || 0 })}
-                        style={{ width: '50%', padding: '5px', border: '1px solid #cbd5e1', borderRadius: '4px' }}
-                      />
-                      <input
-                        type="number"
-                        step="any"
-                        value={destination.lon}
-                        onChange={(e) => setDestination({ ...destination, lon: parseFloat(e.target.value) || 0 })}
-                        style={{ width: '50%', padding: '5px', border: '1px solid #cbd5e1', borderRadius: '4px' }}
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* ปุ่มกดสแกนเส้นทาง หลักในแบบฟอร์ม (มองเห็นทันทีหลังเลือกสถานที่และเวลา) */}
-            <button
-              onClick={handleCheckRain}
-              disabled={loading}
-              style={{
-                width: '100%',
-                minHeight: '50px',
-                padding: '12px',
-                backgroundColor: loading ? '#93c5fd' : '#2563eb',
-                color: 'white',
-                border: 'none',
-                borderRadius: '14px',
-                cursor: loading ? 'not-allowed' : 'pointer',
-                fontWeight: 800,
-                fontSize: '1.02rem',
-                boxShadow: '0 4px 14px rgba(37,99,235,0.3)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                flexShrink: 0,
-              }}
-            >
-              {loading ? '⏳ กำลังคำนวณและสแกนเรดาร์...' : `⚡ สแกนสภาพอากาศเส้นทาง (${getDepartureTimeLabel(departureOffsetMin)})`}
-            </button>
-
-            {/* สรุปผลการวิเคราะห์สภาพอากาศตลอดเส้นทาง */}
-            {data && (
-              <div
-                style={{
-                  padding: '14px',
-                  borderRadius: '12px',
-                  backgroundColor: '#f8fafc',
-                  borderLeft: `6px solid ${getStatusColor(data.summary.status)}`,
-                  boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                  <span style={{ fontSize: '1.05rem', fontWeight: 800, color: getStatusColor(data.summary.status) }}>
-                    {getStatusText(data.summary.status)}
-                  </span>
-                  <span style={{ fontSize: '0.8rem', backgroundColor: '#e2e8f0', color: '#334155', padding: '3px 8px', borderRadius: '10px', fontWeight: 600 }}>
-                    ฝนสูงสุด {data.summary.maxRainProbability}%
-                  </span>
-                </div>
-
-                {data.summary.departureTime && (
-                  <div style={{ fontSize: '0.85rem', color: '#1e293b', fontWeight: 700, marginBottom: '8px', backgroundColor: '#eff6ff', padding: '6px 10px', borderRadius: '8px', border: '1px solid #bfdbfe' }}>
-                    🕒 พยากรณ์สำหรับเวลาออกเดินทาง: <strong>{data.summary.departureTime} น.</strong>
-                  </div>
-                )}
-
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '10px' }}>
-                  <div style={{ backgroundColor: 'white', padding: '8px 10px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontSize: '0.72rem', color: '#64748b' }}>ระยะทางรวม</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: '#0f172a' }}>{data.summary.totalDistanceKm} กม.</div>
-                  </div>
-                  <div style={{ backgroundColor: 'white', padding: '8px 10px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontSize: '0.72rem', color: '#64748b' }}>เวลาประมาณ</div>
-                    <div style={{ fontSize: '1rem', fontWeight: 700, color: '#0f172a' }}>{data.summary.totalDurationMin} นาที</div>
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    padding: '10px',
-                    backgroundColor: '#ffffff',
-                    borderRadius: '8px',
-                    border: '1px solid #e2e8f0',
-                    fontSize: '0.88rem',
-                    color: '#334155',
-                    lineHeight: '1.45',
-                  }}
-                >
-                  💡 <strong>คำแนะนำ:</strong> {data.summary.recommendation}
-                </div>
-              </div>
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  )}
-
-      {/* ================= พื้นที่แผนที่ Leaflet ================= */}
-      <div
-        style={
-          isMobile
-            ? {
-                position: 'absolute',
-                top: 0,
-                left: 0,
-                right: 0,
-                bottom: 0,
-                width: '100%',
-                height: '100%',
-                zIndex: 1,
-              }
-            : {
-                flex: 1,
-                height: '100vh',
-                position: 'relative',
-                zIndex: 1,
-                overflow: 'hidden',
-              }
+      <style>{`
+        @keyframes radarSpin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
         }
-      >
+        @keyframes scanProgressAnim {
+          0% { width: 10%; transform: translateX(-10%); }
+          50% { width: 80%; transform: translateX(15%); }
+          100% { width: 100%; transform: translateX(0%); }
+        }
+        @keyframes navPulse {
+          0% { transform: scale(0.8); opacity: 0.8; }
+          100% { transform: scale(1.6); opacity: 0; }
+        }
+      `}</style>
+
+      {/* แผนที่เต็มจอ */}
+      <div style={{ position: 'absolute', inset: 0, zIndex: 1 }}>
         <MapContainer
           center={[origin.lat, origin.lon]}
           zoom={12}
+          zoomControl={false}
           style={{ height: '100%', width: '100%' }}
         >
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+
+          {showFloodLayer && (
+            <TileLayer
+              key={`gistda-wmts-${floodPeriod}`}
+              url={`https://api-gateway.gistda.or.th/api/2.0/resources/maps/flood/${floodPeriod}/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=vallaris-blank&STYLE=default&TILEMATRIXSET=WebMercatorQuad&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png&api_key=iW8NtubTP0sqLeXaxMkvXZwvZJOIAnYJGf6ka1xc95LBz174Xu5dKwlrSKYx5j1b`}
+              opacity={0.8}
+              zIndex={350}
+              maxZoom={18}
+            />
+          )}
 
           <MapController
             origin={origin}
@@ -1473,20 +1141,22 @@ export function App() {
             isTracking={isTracking}
           />
 
+          <MapFlyController target={mapFlyTarget} />
           <NavigationFollower
             isTracking={isTracking}
             autoFollow={autoFollow}
             setAutoFollow={setAutoFollow}
             liveLocation={liveLocation}
+            origin={origin}
             povMode={povMode}
             routeCoords={polylinePositions}
+            recenterTrigger={recenterTrigger}
           />
 
-          {/* จุดเริ่มต้น (🟢 Origin Marker - แสดงเมื่อไม่ได้เปิด Live Tracking) */}
           {!isTracking && (
             <CircleMarker
               center={[origin.lat, origin.lon]}
-              radius={11}
+              radius={10}
               pathOptions={{
                 fillColor: '#10b981',
                 fillOpacity: 1,
@@ -1495,64 +1165,170 @@ export function App() {
               }}
             >
               <Popup>
-                <div>
+                <div style={{ fontSize: '0.82rem' }}>
                   <strong style={{ color: '#047857' }}>🟢 จุดเริ่มต้น</strong><br />
-                  {originName}<br />
-                  <small style={{ color: '#64748b' }}>({origin.lat.toFixed(4)}, {origin.lon.toFixed(4)})</small>
+                  {originName}
                 </div>
               </Popup>
             </CircleMarker>
           )}
 
-          {/* ไอคอนนำทางหน้ารถแบบหมุนได้ตาม coords.heading (Vehicle Live Cursor) */}
+          {destination && (
+            <CircleMarker
+              center={[destination.lat, destination.lon]}
+              radius={10}
+              pathOptions={{
+                fillColor: '#ef4444',
+                fillOpacity: 1,
+                color: '#ffffff',
+                weight: 3,
+              }}
+            >
+              <Popup>
+                <div style={{ fontSize: '0.82rem' }}>
+                  <strong style={{ color: '#b91c1c' }}>🔴 จุดหมายปลายทาง</strong><br />
+                  {destinationName || 'จุดหมายปลายทาง'}
+                </div>
+              </Popup>
+            </CircleMarker>
+          )}
+
           {liveLocation && (
             <Marker
               position={[liveLocation.lat, liveLocation.lon]}
-              icon={createVehicleNavIcon(liveLocation.heading)}
+              icon={createVehicleNavIcon(liveLocation.heading, vehicleType)}
               zIndexOffset={1000}
             >
               <Popup>
-                <div>
-                  <strong style={{ color: '#2563eb' }}>🏍️ ตำแหน่งรถของคุณ (Live GPS)</strong><br />
-                  {liveLocation.speed !== null && <span>ความเร็ว: <strong>{liveLocation.speed} กม./ชม.</strong><br /></span>}
-                  {liveLocation.heading !== null && <span>ทิศทาง: <strong>{Math.round(liveLocation.heading)}°</strong><br /></span>}
-                  ความแม่นยำ: ±{liveLocation.accuracy} เมตร
+                <div style={{ fontSize: '0.82rem' }}>
+                  <strong style={{ color: vehicleType === 'motorcycle' ? '#059669' : '#2563eb' }}>
+                    {vehicleType === 'motorcycle' ? 'มอเตอร์ไซค์ของคุณ' : 'รถยนต์ของคุณ'} (Live GPS)
+                  </strong><br />
+                  ความเร็ว: <strong>{liveLocation.speed} กม./ชม.</strong><br />
+                  ทิศทาง: <strong>{liveLocation.heading !== null ? Math.round(liveLocation.heading) : 0}°</strong>
                 </div>
               </Popup>
             </Marker>
           )}
 
-          {/* จุดปลายทาง (🔴 Destination Marker) */}
-          <CircleMarker
-            center={[destination.lat, destination.lon]}
-            radius={11}
-            pathOptions={{
-              fillColor: '#ef4444',
-              fillOpacity: 1,
-              color: '#ffffff',
-              weight: 3,
-            }}
-          >
-            <Popup>
-              <div>
-                <strong style={{ color: '#b91c1c' }}>🔴 จุดหมายปลายทาง</strong><br />
-                {destinationName}<br />
-                <small style={{ color: '#64748b' }}>({destination.lat.toFixed(4)}, {destination.lon.toFixed(4)})</small>
-              </div>
-            </Popup>
-          </CircleMarker>
-
-          {/* เส้นทางการขับขี่ */}
-          {polylinePositions.length > 0 && (
-            <Polyline positions={polylinePositions} color="#2563eb" weight={6} opacity={0.85} />
+          {/* 1. เลเยอร์พื้นที่น้ำท่วมจาก GISTDA (วาดไว้ใต้เส้นทาง เพื่อไม่ให้บังการคลิกเส้นทาง) */}
+          {showFloodLayer && floodData && Array.isArray(floodData.features) && floodData.features.length > 0 && (
+            <GeoJSON
+              key={`flood-${floodPeriod}-${floodData.features.length}`}
+              data={floodData}
+              style={() => ({
+                fillColor: '#0284c7',
+                fillOpacity: 0.45,
+                color: '#0369a1',
+                weight: 1.5,
+                dashArray: '3, 3',
+              })}
+              onEachFeature={(feature: any, layer: any) => {
+                const p = feature.properties || {};
+                const areaRai = p.f_area ? (p.f_area / 1600).toFixed(1) : (p._area ? (p._area / 1600).toFixed(1) : '-');
+                const areaSqm = p.f_area ? Math.round(p.f_area).toLocaleString() : (p._area ? Math.round(p._area).toLocaleString() : '-');
+                const dateStr = p._updatedAt || p._createdAt || '';
+                const formattedDate = dateStr ? new Date(dateStr).toLocaleDateString('th-TH') : '-';
+                layer.bindPopup(`
+                  <div style="font-family: 'Prompt', sans-serif; font-size: 0.85rem; min-width: 180px;">
+                    <div style="display: flex; align-items: center; gap: 6px; color: #0284c7; font-weight: 800; font-size: 0.95rem; margin-bottom: 6px;">
+                      <span>🌊</span> <span>พื้นที่น้ำท่วม (GISTDA)</span>
+                    </div>
+                    <div style="margin-bottom: 2px;"><strong>จังหวัด:</strong> ${p.pv_tn || p.pv_en || '-'}</div>
+                    <div style="margin-bottom: 2px;"><strong>อำเภอ:</strong> ${p.ap_tn || p.ap_en || '-'}</div>
+                    <div style="margin-bottom: 2px;"><strong>ตำบล:</strong> ${p.tb_tn || p.tb_en || '-'}</div>
+                    <div style="margin-bottom: 2px;"><strong>ขนาดพื้นที่:</strong> <span style="color: #0369a1; font-weight: 700;">${areaRai} ไร่</span> (${areaSqm} ตร.ม.)</div>
+                    <div style="font-size: 0.72rem; color: #64748b; margin-top: 6px; border-top: 1px dashed #e2e8f0; padding-top: 4px;">อัปเดตดาวเทียม: ${formattedDate}</div>
+                  </div>
+                `);
+              }}
+            />
           )}
 
-          {/* จุดตรวจสอบสภาพอากาศ (Checkpoints พร้อมเวลา ETA) */}
-          {data?.checkpoints.map((pt) => (
+          {/* 2. เส้นทางทั้งหมด (เรียงให้เส้นเทาวาดก่อน แล้วเส้นน้ำเงินที่เลือกวาดทับด้านบน) */}
+          {data?.routes && (() => {
+            const indexedRoutes = data.routes.map((rt, idx) => ({ ...rt, originalIdx: idx }));
+            // เรียงให้เส้นที่เลือกอยู่ลำดับสุดท้าย เพื่อให้อยู่บนสุดใน SVG
+            const sortedRoutes = [...indexedRoutes].sort((a, b) => {
+              if (a.originalIdx === selectedRouteIndex) return 1;
+              if (b.originalIdx === selectedRouteIndex) return -1;
+              return 0;
+            });
+
+            return sortedRoutes.map((rt) => {
+              const isSelected = selectedRouteIndex === rt.originalIdx;
+              const positions = rt.geometry.coordinates.map(([lon, lat]: [number, number]) => [lat, lon] as [number, number]);
+              if (positions.length === 0) return null;
+
+              const midFactor = rt.originalIdx === 0 ? 0.42 : (0.52 + (rt.originalIdx * 0.08));
+              const midIndex = Math.min(Math.floor(positions.length * midFactor), positions.length - 1);
+              const badgePosition = positions[midIndex];
+
+              return (
+                <React.Fragment key={`route-group-${rt.originalIdx}`}>
+                  {/* 2.1 เส้นคลิกอ้วนโปร่งใส (Fat Click Area) กว้าง 36px เพื่อให้แตะหรือคลิกบนเส้นสีเทาได้ง่ายและติดแน่นอน */}
+                  <Polyline
+                    positions={positions}
+                    pathOptions={{
+                      color: '#000000',
+                      opacity: 0.0001,
+                      weight: 36,
+                      lineCap: 'round',
+                      lineJoin: 'round',
+                      interactive: true,
+                    }}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setSelectedRouteIndex(rt.originalIdx);
+                      },
+                    }}
+                  />
+
+                  {/* 2.2 เส้นทางที่มองเห็น (Visible Polyline: สีน้ำเงิน = เลือก, สีเทา = ยังไม่เลือก) */}
+                  <Polyline
+                    positions={positions}
+                    pathOptions={{
+                      color: isSelected ? '#1a73e8' : '#78909c',
+                      weight: isSelected ? 8 : 6,
+                      opacity: isSelected ? 1 : 0.8,
+                      lineCap: 'round',
+                      lineJoin: 'round',
+                      interactive: true,
+                    }}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setSelectedRouteIndex(rt.originalIdx);
+                      },
+                    }}
+                  />
+
+                  {/* 2.3 ป้ายเวลาบนเส้นทาง (Google Maps Callout Marker) */}
+                  {badgePosition && (
+                    <Marker
+                      position={badgePosition}
+                      icon={isSelected ? createSelectedRouteBadge(rt, rt.originalIdx) : createAltRouteBadge(rt, rt.originalIdx)}
+                      zIndexOffset={isSelected ? 3000 : 1500}
+                      eventHandlers={{
+                        click: (e) => {
+                          L.DomEvent.stopPropagation(e);
+                          setSelectedRouteIndex(rt.originalIdx);
+                        },
+                      }}
+                    />
+                  )}
+                </React.Fragment>
+              );
+            });
+          })()}
+
+          {/* 3. จุดตรวจสภาพอากาศ */}
+          {(activeRoute?.checkpoints || data?.checkpoints || []).map((pt) => (
             <CircleMarker
               key={pt.id}
               center={[pt.lat, pt.lon]}
-              radius={8}
+              radius={7}
               pathOptions={{
                 fillColor: getStatusColor(pt.status),
                 fillOpacity: 1,
@@ -1561,276 +1337,1515 @@ export function App() {
               }}
             >
               <Popup>
-                <div>
-                  <strong>จุดตรวจสอบที่ {pt.id}</strong><br />
-                  {pt.etaTime && <span>⏱️ ถึงประมาณ: <strong>{pt.etaTime} น.</strong><br /></span>}
+                <div style={{ fontSize: '0.82rem' }}>
+                  <strong>จุดที่ {pt.id} {pt.etaTime && `(ถึง ~ ${pt.etaTime} น.)`}</strong><br />
+                  สถานะ: <span style={{ color: getStatusColor(pt.status), fontWeight: 700 }}>{getStatusText(pt.status)}</span><br />
                   โอกาสฝนตก: <strong>{pt.rainProbability}%</strong><br />
-                  ปริมาณฝน: <strong>{pt.rainAmountMm} มม.</strong><br />
-                  ระดับ: <span style={{ color: getStatusColor(pt.status), fontWeight: 'bold' }}>{pt.status}</span>
+                  ปริมาณฝน: <strong>{pt.rainAmountMm} มม.</strong>
                 </div>
               </Popup>
             </CircleMarker>
           ))}
         </MapContainer>
+      </div>
 
-        {/* ================= โหมดนำทางสดเต็มจอ (เมื่อกดเริ่มเดินทาง: ซ่อน Box เหลือแค่เรากับแมพ) ================= */}
-        {isTracking && (
-          <>
-            {/* Top HUD: แถบสถานะความเร็วและสภาพอากาศลอยด้านบน */}
-            <div
+      {/* TOP FLOATING ISLAND */}
+      {!isTracking && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'max(16px, env(safe-area-inset-top))',
+            left: '16px',
+            right: '16px',
+            zIndex: 100,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '12px',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              pointerEvents: 'auto',
+              backgroundColor: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(20px)',
+              borderRadius: '30px',
+              padding: '6px 10px',
+              boxShadow: '0 10px 30px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.04)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '10px',
+              border: '1px solid rgba(255, 255, 255, 0.8)',
+            }}
+          >
+            <button
+              onClick={() => {
+                const nextVehicle = vehicleType === 'motorcycle' ? 'car' : 'motorcycle';
+                const nextToll = nextVehicle === 'motorcycle';
+                const nextHigh = nextVehicle === 'motorcycle';
+                setVehicleType(nextVehicle);
+                setAvoidTollways(nextToll);
+                setAvoidHighways(nextHigh);
+                if (data && destination) handleCheckRain(nextVehicle, nextToll, nextHigh);
+              }}
               style={{
-                position: 'absolute',
-                top: 'max(14px, env(safe-area-inset-top))',
-                left: '12px',
-                right: '12px',
-                zIndex: 1000,
-                backgroundColor: 'rgba(15, 23, 42, 0.92)',
-                backdropFilter: 'blur(10px)',
-                borderRadius: '20px',
-                padding: '10px 14px',
-                boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
                 display: 'flex',
                 alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: '10px',
-                color: '#ffffff',
+                gap: '6px',
+                backgroundColor: vehicleType === 'motorcycle' ? '#ecfdf5' : '#eff6ff',
+                color: vehicleType === 'motorcycle' ? '#047857' : '#1d4ed8',
+                border: `1.5px solid ${vehicleType === 'motorcycle' ? '#a7f3d0' : '#bfdbfe'}`,
+                borderRadius: '20px',
+                padding: '6px 12px',
+                fontSize: '0.82rem',
+                fontWeight: 800,
+                cursor: 'pointer',
               }}
             >
-              {/* Digital Speedometer */}
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
-                <span
-                  style={{
-                    fontSize: '1.7rem',
-                    fontWeight: 900,
-                    color: '#38bdf8',
-                    fontVariantNumeric: 'tabular-nums',
-                    lineHeight: 1,
-                  }}
-                >
-                  {liveLocation?.speed != null ? liveLocation.speed : '0'}
-                </span>
-                <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>กม./ชม.</span>
-              </div>
+              <Icon
+                icon={vehicleType === 'motorcycle' ? 'solar:scooter-bold-duotone' : 'solar:car-bold-duotone'}
+                width="18"
+                height="18"
+              />
+              <span>{vehicleType === 'motorcycle' ? 'มอเตอร์ไซค์' : 'รถยนต์'}</span>
+            </button>
 
-              {/* สรุปสภาพอากาศ & ปลายทาง */}
-              <div style={{ flex: 1, minWidth: 0, textAlign: 'center' }}>
-                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                  <span
-                    style={{
-                      backgroundColor: data ? getStatusColor(data.summary.status) : '#2563eb',
-                      color: '#ffffff',
-                      padding: '3px 10px',
-                      borderRadius: '12px',
-                      fontSize: '0.78rem',
-                      fontWeight: 800,
-                      whiteSpace: 'nowrap',
-                    }}
-                  >
-                    {data ? getStatusText(data.summary.status) : '🧭 กำลังนำทาง'}
-                  </span>
-                </div>
-                <div
-                  style={{
-                    fontSize: '0.78rem',
-                    color: '#cbd5e1',
-                    marginTop: '2px',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  🏁 {destinationName} {data ? `(${data.summary.totalDistanceKm} กม.)` : ''}
-                </div>
-              </div>
-
-              {/* ปุ่มหยุดนำทาง ด่วน (นำ Box กลับมา) */}
-              <button
-                onClick={toggleTracking}
+            <div
+              onClick={() => setActiveSheet('LOCATIONS')}
+              style={{
+                flex: 1,
+                minWidth: 0,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 6px',
+              }}
+            >
+              <Icon icon="solar:map-point-bold-duotone" width="18" height="18" style={{ color: destination ? '#ef4444' : '#94a3b8', flexShrink: 0 }} />
+              <span
                 style={{
-                  backgroundColor: '#ef4444',
-                  color: '#ffffff',
-                  border: 'none',
-                  borderRadius: '12px',
-                  padding: '8px 12px',
-                  fontSize: '0.8rem',
-                  fontWeight: 800,
-                  cursor: 'pointer',
-                  boxShadow: '0 2px 10px rgba(239,68,68,0.4)',
+                  fontSize: '0.86rem',
+                  fontWeight: destination ? 700 : 500,
+                  color: destination ? '#0f172a' : '#64748b',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                 }}
               >
-                🛑 หยุด
-              </button>
+                {destinationName || 'เลือกจุดหมายปลายทาง...'}
+              </span>
             </div>
 
-            {/* Bottom Controls Bar: ปุ่มเปลี่ยน POV มุมมองคนขับ / ภาพรวม และปุ่มจัดกึ่งกลาง */}
-            <div
+            <button
+              onClick={() => setActiveSheet('LOCATIONS')}
               style={{
-                position: 'absolute',
-                bottom: 'max(20px, env(safe-area-inset-bottom))',
-                left: '14px',
-                right: '14px',
-                zIndex: 1000,
+                backgroundColor: '#f1f5f9',
+                color: '#334155',
+                border: 'none',
+                borderRadius: '50%',
+                width: '36px',
+                height: '36px',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '10px',
-                pointerEvents: 'none',
+                cursor: 'pointer',
               }}
             >
-              {/* ปุ่มเปลี่ยน POV สไตล์ Google Maps (ซูมประชิดตัวรถ 17.5 VS ภาพรวมเส้นทาง) */}
+              <Icon icon="solar:magnifer-bold" width="18" height="18" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* FLOATING GISTDA FLOOD CONTROLLER */}
+      {!isTracking && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'max(84px, env(safe-area-inset-top) + 68px)',
+            right: '16px',
+            zIndex: 90,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'flex-end',
+            gap: '6px',
+          }}
+        >
+          <div
+            style={{
+              backgroundColor: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(16px)',
+              borderRadius: '24px',
+              padding: '4px 6px 4px 10px',
+              boxShadow: '0 8px 24px rgba(0, 0, 0, 0.12)',
+              border: showFloodLayer ? '1.5px solid #38bdf8' : '1px solid rgba(226, 232, 240, 0.8)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+            }}
+          >
+            <button
+              onClick={() => setShowFloodLayer(!showFloodLayer)}
+              style={{
+                backgroundColor: 'transparent',
+                border: 'none',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                fontSize: '0.78rem',
+                fontWeight: 700,
+                color: showFloodLayer ? '#0284c7' : '#64748b',
+                cursor: 'pointer',
+                padding: '4px 0',
+              }}
+            >
+              <Icon
+                icon={isFloodLoading ? 'solar:refresh-circle-bold' : 'solar:waterdrop-bold-duotone'}
+                width="18"
+                height="18"
+                className={isFloodLoading ? 'animate-spin' : ''}
+                style={{ color: showFloodLayer ? '#0284c7' : '#94a3b8' }}
+              />
+              <span>น้ำท่วม</span>
+              {showFloodLayer && floodData?.features && (
+                <span
+                  style={{
+                    backgroundColor: '#e0f2fe',
+                    color: '#0369a1',
+                    borderRadius: '10px',
+                    padding: '1px 6px',
+                    fontSize: '0.68rem',
+                    fontWeight: 800,
+                  }}
+                >
+                  {floodData.features.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => setShowFloodMenu(!showFloodMenu)}
+              style={{
+                backgroundColor: showFloodMenu ? '#e0f2fe' : '#f1f5f9',
+                border: 'none',
+                borderRadius: '50%',
+                width: '26px',
+                height: '26px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: '#0369a1',
+              }}
+            >
+              <Icon icon="solar:alt-arrow-down-bold" width="12" height="12" />
+            </button>
+          </div>
+
+          {showFloodMenu && (
+            <div
+              style={{
+                backgroundColor: 'rgba(255, 255, 255, 0.98)',
+                backdropFilter: 'blur(20px)',
+                borderRadius: '18px',
+                padding: '12px 14px',
+                boxShadow: '0 10px 30px rgba(0,0,0,0.18)',
+                border: '1px solid #e2e8f0',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+                minWidth: '240px',
+              }}
+            >
+              <div style={{ fontSize: '0.8rem', fontWeight: 800, color: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                  <Icon icon="solar:satellite-bold-duotone" width="16" height="16" style={{ color: '#0284c7' }} />
+                  <span>น้ำท่วม GISTDA ทั้งประเทศ</span>
+                </span>
+                <span style={{ fontSize: '0.68rem', color: '#0284c7', fontWeight: 700, backgroundColor: '#e0f2fe', padding: '2px 6px', borderRadius: '8px' }}>
+                  {floodPeriod === '1day' ? '1 วัน' : 'สะสม 7 วัน'}
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                  onClick={() => {
+                    fetchFloodData('1day');
+                    setShowFloodLayer(true);
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: '6px 8px',
+                    borderRadius: '8px',
+                    border: floodPeriod === '1day' ? '1.5px solid #0284c7' : '1px solid #e2e8f0',
+                    backgroundColor: floodPeriod === '1day' ? '#e0f2fe' : '#ffffff',
+                    color: floodPeriod === '1day' ? '#0369a1' : '#475569',
+                    fontSize: '0.72rem',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  1 วันล่าสุด
+                </button>
+                <button
+                  onClick={() => {
+                    fetchFloodData('7days');
+                    setShowFloodLayer(true);
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: '6px 8px',
+                    borderRadius: '8px',
+                    border: floodPeriod === '7days' ? '1.5px solid #0284c7' : '1px solid #e2e8f0',
+                    backgroundColor: floodPeriod === '7days' ? '#e0f2fe' : '#ffffff',
+                    color: floodPeriod === '7days' ? '#0369a1' : '#475569',
+                    fontSize: '0.72rem',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  สะสม 7 วัน
+                </button>
+              </div>
+
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#475569', marginTop: '2px' }}>
+                ซูมดูพื้นที่น้ำท่วม:
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+                <button
+                  onClick={() => {
+                    setShowFloodLayer(true);
+                    setMapFlyTarget({ lat: 13.7367, lon: 100.5231, zoom: 6 });
+                    setShowFloodMenu(false);
+                  }}
+                  style={{
+                    backgroundColor: '#0284c7',
+                    color: '#ffffff',
+                    border: 'none',
+                    borderRadius: '8px',
+                    padding: '6px 8px',
+                    fontSize: '0.72rem',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '4px',
+                  }}
+                >
+                  <span>🇹🇭</span> ทั้งประเทศ
+                </button>
+                <button
+                  onClick={() => {
+                    setShowFloodLayer(true);
+                    setMapFlyTarget({ lat: 14.204, lon: 100.549, zoom: 11 });
+                    setShowFloodMenu(false);
+                  }}
+                  style={{
+                    backgroundColor: '#f0f9ff',
+                    color: '#0369a1',
+                    border: '1px solid #bae6fd',
+                    borderRadius: '8px',
+                    padding: '6px 8px',
+                    fontSize: '0.72rem',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                  }}
+                >
+                  📍 ภาคกลาง / อยุธยา
+                </button>
+                <button
+                  onClick={() => {
+                    setShowFloodLayer(true);
+                    setMapFlyTarget({ lat: 17.005, lon: 99.826, zoom: 10 });
+                    setShowFloodMenu(false);
+                  }}
+                  style={{
+                    backgroundColor: '#f0f9ff',
+                    color: '#0369a1',
+                    border: '1px solid #bae6fd',
+                    borderRadius: '8px',
+                    padding: '6px 8px',
+                    fontSize: '0.72rem',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                  }}
+                >
+                  📍 ภาคเหนือ / สุโขทัย
+                </button>
+                <button
+                  onClick={() => {
+                    setShowFloodLayer(true);
+                    setMapFlyTarget({ lat: 17.146, lon: 103.007, zoom: 10 });
+                    setShowFloodMenu(false);
+                  }}
+                  style={{
+                    backgroundColor: '#f0f9ff',
+                    color: '#0369a1',
+                    border: '1px solid #bae6fd',
+                    borderRadius: '8px',
+                    padding: '6px 8px',
+                    fontSize: '0.72rem',
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                  }}
+                >
+                  📍 ภาคอีสาน / อุดร
+                </button>
+              </div>
+
+              <div style={{ fontSize: '0.68rem', color: '#64748b', lineHeight: 1.3, textAlign: 'center', marginTop: '4px' }}>
+                {floodPeriod === '1day' && (!floodData?.features || floodData.features.length === 0)
+                  ? 'ยังไม่มีภาพดาวเทียมใหม่ 24 ชม. (สลับไป 7 วันอัตโนมัติ)'
+                  : `แสดงผล ${floodData?.features?.length?.toLocaleString() || 0} แปลงทั่วไทย`}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* GOOGLE MAPS ROUTE SUMMARY SHEET */}
+      {!isTracking && activeRoute && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 'max(84px, env(safe-area-inset-bottom) + 68px)',
+            left: '16px',
+            right: '16px',
+            zIndex: 110,
+            display: 'flex',
+            justifyContent: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              pointerEvents: 'auto',
+              backgroundColor: '#ffffff',
+              borderRadius: '24px',
+              padding: '16px 18px',
+              boxShadow: '0 12px 36px rgba(0, 0, 0, 0.16), 0 2px 8px rgba(0,0,0,0.06)',
+              border: '1px solid #e2e8f0',
+              width: '100%',
+              maxWidth: '400px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+            }}
+          >
+            <div style={{ width: '36px', height: '4px', backgroundColor: '#e2e8f0', borderRadius: '2px', alignSelf: 'center', marginBottom: '2px' }} />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <div>
+                <span style={{ fontSize: '1.45rem', fontWeight: 900, color: '#1a73e8' }}>
+                  {activeRoute.durationFormatted || formatDuration(activeRoute.durationMin)}
+                </span>
+                <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#5f6368', marginLeft: '6px' }}>
+                  ({activeRoute.distanceKm} กม.)
+                </span>
+              </div>
+
+              <span
+                onClick={() => setActiveSheet('SUMMARY')}
+                style={{
+                  fontSize: '0.74rem',
+                  fontWeight: 800,
+                  padding: '3px 8px',
+                  borderRadius: '12px',
+                  backgroundColor: activeRoute.maxRainProbability > 30 ? '#fee2e2' : '#ecfdf5',
+                  color: activeRoute.maxRainProbability > 30 ? '#dc2626' : '#059669',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <Icon icon={activeRoute.maxRainProbability > 30 ? 'solar:cloud-rain-bold-duotone' : 'solar:sun-2-bold-duotone'} width="14" height="14" />
+                {activeRoute.maxRainProbability > 30 ? `ฝน ${activeRoute.maxRainProbability}%` : 'ถนนแห้ง'}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', fontSize: '0.78rem', color: '#4b5563' }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '4px', fontWeight: 700, color: activeRoute.hasTollway ? '#d97706' : '#059669', flexShrink: 0 }}>
+                <Icon icon={activeRoute.hasTollway ? 'solar:road-bold-duotone' : 'solar:shield-check-bold'} width="14" height="14" />
+                {activeRoute.hasTollway ? `ขึ้นทางด่วน (~ ${activeRoute.tollDistanceKm} กม.)` : 'ไม่ขึ้นทางด่วน (ทางราบ)'}
+              </span>
+
+              {/* Drop Option สำหรับเลือกเส้นทาง */}
+              {data?.routes && data.routes.length > 1 ? (
+                <div style={{ position: 'relative', display: 'flex', alignItems: 'center', flexShrink: 0 }}>
+                  <select
+                    value={selectedRouteIndex}
+                    onChange={(e) => {
+                      const newIdx = Number(e.target.value);
+                      setSelectedRouteIndex(newIdx);
+                    }}
+                    style={{
+                      appearance: 'none',
+                      WebkitAppearance: 'none',
+                      backgroundColor: '#eff6ff',
+                      color: '#1d4ed8',
+                      border: '1.5px solid #93c5fd',
+                      borderRadius: '14px',
+                      padding: '4px 26px 4px 10px',
+                      fontSize: '0.76rem',
+                      fontWeight: 800,
+                      cursor: 'pointer',
+                      outline: 'none',
+                      boxShadow: '0 2px 6px rgba(37,99,235,0.12)',
+                    }}
+                  >
+                    {data.routes.map((rt: any, i: number) => (
+                      <option key={`opt-rt-${i}`} value={i}>
+                        {rt.name || `เส้นทางที่ ${i + 1}`} ({rt.durationFormatted || rt.durationMin + ' นาที'})
+                      </option>
+                    ))}
+                  </select>
+                  <Icon
+                    icon="solar:alt-arrow-down-bold"
+                    width="12"
+                    height="12"
+                    style={{
+                      position: 'absolute',
+                      right: '8px',
+                      color: '#1d4ed8',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                </div>
+              ) : (
+                <span style={{ color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  • {activeRoute.name}
+                </span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+              <button
+                onClick={toggleTracking}
+                style={{
+                  flex: 1,
+                  backgroundColor: '#1a73e8',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '18px',
+                  padding: '11px 16px',
+                  fontSize: '0.92rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  boxShadow: '0 4px 14px rgba(26,115,232,0.35)',
+                }}
+              >
+                <Icon icon="solar:navigation-bold" width="18" height="18" />
+                <span>เริ่มเดินทาง</span>
+              </button>
+
+              <button
+                onClick={() => setActiveSheet('SUMMARY')}
+                style={{
+                  backgroundColor: '#f1f5f9',
+                  color: '#334155',
+                  border: 'none',
+                  borderRadius: '18px',
+                  padding: '11px 14px',
+                  fontSize: '0.85rem',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <Icon icon="solar:cloud-rain-bold-duotone" width="16" height="16" />
+                <span>ดูฝน</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BOTTOM FLOATING ACTION DOCK */}
+      {!isTracking && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 'max(20px, env(safe-area-inset-bottom))',
+            left: '16px',
+            right: '16px',
+            zIndex: 100,
+            display: 'flex',
+            justifyContent: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              pointerEvents: 'auto',
+              backgroundColor: 'rgba(255, 255, 255, 0.96)',
+              backdropFilter: 'blur(20px)',
+              borderRadius: '36px',
+              padding: '8px 16px',
+              boxShadow: '0 14px 38px rgba(0, 0, 0, 0.16), 0 3px 8px rgba(0, 0, 0, 0.05)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '14px',
+              border: '1px solid rgba(255, 255, 255, 0.8)',
+              width: '100%',
+              maxWidth: '390px',
+            }}
+          >
+            <button
+              onClick={handleGetCurrentLocation}
+              disabled={isGpsLoading}
+              style={{
+                backgroundColor: 'transparent',
+                border: 'none',
+                borderRadius: '50%',
+                width: '42px',
+                height: '42px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: '#3b82f6',
+              }}
+            >
+              <Icon
+                icon={isGpsLoading ? 'solar:refresh-circle-bold' : 'solar:gps-bold-duotone'}
+                width="24"
+                height="24"
+                className={isGpsLoading ? 'animate-spin' : ''}
+              />
+            </button>
+
+            <button
+              onClick={() => setActiveSheet(activeSheet === 'TIME' ? 'NONE' : 'TIME')}
+              style={{
+                backgroundColor: departureOffsetMin > 0 ? '#eff6ff' : 'transparent',
+                border: 'none',
+                borderRadius: '50%',
+                width: '42px',
+                height: '42px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: departureOffsetMin > 0 ? '#2563eb' : '#64748b',
+                position: 'relative',
+              }}
+            >
+              <Icon icon="solar:clock-circle-bold-duotone" width="24" height="24" />
+              {departureOffsetMin > 0 && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    top: '4px',
+                    right: '4px',
+                    width: '8px',
+                    height: '8px',
+                    backgroundColor: '#ef4444',
+                    borderRadius: '50%',
+                  }}
+                />
+              )}
+            </button>
+
+            <button
+              onClick={() => {
+                if (!destination) {
+                  setActiveSheet('LOCATIONS');
+                } else {
+                  handleCheckRain(vehicleType, avoidTollways, avoidHighways);
+                }
+              }}
+              disabled={loading}
+              style={{
+                width: '56px',
+                height: '56px',
+                borderRadius: '50%',
+                background: 'linear-gradient(135deg, #f43f5e 0%, #e11d48 100%)',
+                color: '#ffffff',
+                border: '3px solid #ffffff',
+                boxShadow: '0 8px 24px rgba(244, 63, 94, 0.45)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: loading ? 'not-allowed' : 'pointer',
+                transform: 'translateY(-8px)',
+              }}
+            >
+              <Icon
+                icon={loading ? 'solar:refresh-circle-bold' : (destination ? 'solar:radar-2-bold-duotone' : 'solar:map-point-search-bold-duotone')}
+                width="28"
+                height="28"
+                className={loading ? 'animate-spin' : ''}
+              />
+            </button>
+
+            <button
+              onClick={() => setActiveSheet(activeSheet === 'AVOID' ? 'NONE' : 'AVOID')}
+              style={{
+                backgroundColor: (avoidTollways || avoidHighways) ? '#fef3c7' : 'transparent',
+                border: 'none',
+                borderRadius: '50%',
+                width: '42px',
+                height: '42px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: (avoidTollways || avoidHighways) ? '#d97706' : '#64748b',
+              }}
+            >
+              <Icon icon="solar:tuning-bold-duotone" width="24" height="24" />
+            </button>
+
+            <button
+              onClick={toggleTracking}
+              style={{
+                backgroundColor: 'transparent',
+                border: 'none',
+                borderRadius: '50%',
+                width: '42px',
+                height: '42px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                color: '#10b981',
+              }}
+            >
+              <Icon icon="solar:compass-bold-duotone" width="24" height="24" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* SLIDE-UP MODAL SHEETS */}
+      {activeSheet !== 'NONE' && (
+        <div
+          onClick={() => setActiveSheet('NONE')}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 150,
+            backgroundColor: 'rgba(15, 23, 42, 0.35)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'flex-end',
+            justifyContent: 'center',
+            padding: isMobile ? '0' : '24px',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: '#ffffff',
+              borderTopLeftRadius: '28px',
+              borderTopRightRadius: '28px',
+              borderBottomLeftRadius: isMobile ? '0' : '28px',
+              borderBottomRightRadius: isMobile ? '0' : '28px',
+              width: '100%',
+              maxWidth: '440px',
+              maxHeight: '80vh',
+              overflowY: 'auto',
+              padding: '20px 22px 28px 22px',
+              boxShadow: '0 -10px 40px rgba(0, 0, 0, 0.25)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '14px',
+            }}
+          >
+            <div style={{ width: '40px', height: '4px', backgroundColor: '#e2e8f0', borderRadius: '2px', alignSelf: 'center', marginBottom: '4px' }} />
+
+            {/* SHEET 1: LOCATIONS */}
+            {activeSheet === 'LOCATIONS' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Icon icon="solar:routing-bold-duotone" width="24" height="24" style={{ color: '#2563eb' }} />
+                    <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 800, color: '#0f172a' }}>ค้นหาเส้นทาง</h3>
+                  </div>
+                  <button
+                    onClick={() => setActiveSheet('NONE')}
+                    style={{ border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#64748b' }}
+                  >
+                    <Icon icon="solar:close-circle-bold" width="20" height="20" />
+                  </button>
+                </div>
+
+                <div ref={originInputRef} style={{ position: 'relative' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                    <label style={{ fontSize: '0.8rem', fontWeight: 700, color: '#059669', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Icon icon="solar:map-point-bold-duotone" width="16" height="16" /> จุดเริ่มต้น
+                    </label>
+                    <span onClick={handleGetCurrentLocation} style={{ fontSize: '0.75rem', color: '#2563eb', cursor: 'pointer', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '3px' }}>
+                      <Icon icon="solar:gps-bold-duotone" width="14" height="14" /> ใช้พิกัดฉัน
+                    </span>
+                  </div>
+                  <input
+                    type="text"
+                    value={originName}
+                    onChange={(e) => { setOriginName(e.target.value); setShowOriginDropdown(true); }}
+                    onFocus={() => setShowOriginDropdown(true)}
+                    placeholder="ค้นหาจุดเริ่มต้น..."
+                    style={{ width: '100%', padding: '10px 12px', borderRadius: '12px', border: '1.5px solid #cbd5e1', fontSize: '0.9rem', boxSizing: 'border-box' }}
+                  />
+                  {showOriginDropdown && originSuggestions.length > 0 && (
+                    <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 10, backgroundColor: '#ffffff', borderRadius: '10px', boxShadow: '0 6px 20px rgba(0,0,0,0.15)', marginTop: '4px', maxHeight: '160px', overflowY: 'auto' }}>
+                      {originSuggestions.map((item) => (
+                        <div
+                          key={item.place_id}
+                          onClick={() => {
+                            setOrigin({ lat: parseFloat(item.lat), lon: parseFloat(item.lon) });
+                            setOriginName(item.display_name.split(',').slice(0, 3).join(', '));
+                            setShowOriginDropdown(false);
+                          }}
+                          style={{ padding: '8px 12px', borderBottom: '1px solid #f1f5f9', cursor: 'pointer', fontSize: '0.82rem' }}
+                        >
+                          {item.display_name}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'center' }}>
+                  <button
+                    onClick={handleSwapLocations}
+                    style={{
+                      backgroundColor: '#f1f5f9',
+                      border: 'none',
+                      borderRadius: '20px',
+                      padding: '5px 14px',
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                      color: '#475569',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                    }}
+                  >
+                    <Icon icon="solar:transfer-vertical-bold" width="16" height="16" /> สลับต้นทาง - ปลายทาง
+                  </button>
+                </div>
+
+                <div ref={destInputRef} style={{ position: 'relative' }}>
+                  <label style={{ fontSize: '0.8rem', fontWeight: 700, color: '#b91c1c', display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '4px' }}>
+                    <Icon icon="solar:flag-bold-duotone" width="16" height="16" /> ปลายทาง (กรุณาเลือก)
+                  </label>
+                  <input
+                    type="text"
+                    value={destinationName}
+                    onChange={(e) => { setDestinationName(e.target.value); setShowDestDropdown(true); }}
+                    onFocus={() => setShowDestDropdown(true)}
+                    placeholder="พิมพ์จุดหมายปลายทาง เช่น สยาม, ฟิวเจอร์พาร์ค..."
+                    autoFocus={!destination}
+                    style={{
+                      width: '100%',
+                      padding: '10px 12px',
+                      borderRadius: '12px',
+                      border: destination ? '1.5px solid #cbd5e1' : '2px solid #f43f5e',
+                      fontSize: '0.9rem',
+                      boxSizing: 'border-box',
+                    }}
+                  />
+                  {showDestDropdown && destSuggestions.length > 0 && (
+                    <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 10, backgroundColor: '#ffffff', borderRadius: '10px', boxShadow: '0 6px 20px rgba(0,0,0,0.15)', marginTop: '4px', maxHeight: '160px', overflowY: 'auto' }}>
+                      {destSuggestions.map((item) => (
+                        <div
+                          key={item.place_id}
+                          onClick={() => {
+                            const newLat = parseFloat(item.lat);
+                            const newLon = parseFloat(item.lon);
+                            const shortName = item.display_name.split(',').slice(0, 3).join(', ');
+                            setDestination({ lat: newLat, lon: newLon });
+                            setDestinationName(shortName);
+                            setShowDestDropdown(false);
+                            handleCheckRain(vehicleType, avoidTollways, avoidHighways, { lat: newLat, lon: newLon, name: shortName });
+                          }}
+                          style={{ padding: '8px 12px', borderBottom: '1px solid #f1f5f9', cursor: 'pointer', fontSize: '0.82rem' }}
+                        >
+                          {item.display_name}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <div style={{ fontSize: '0.74rem', color: '#64748b', fontWeight: 700, marginBottom: '6px' }}>
+                    ปลายทางยอดนิยม:
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                    {[
+                      { name: 'ฟิวเจอร์พาร์ค รังสิต', lat: 13.9892, lon: 100.6177 },
+                      { name: 'สยามพารากอน', lat: 13.7466, lon: 100.5348 },
+                      { name: 'สนามบินดอนเมือง', lat: 13.9132, lon: 100.6042 },
+                      { name: 'สนามบินสุวรรณภูมิ', lat: 13.6900, lon: 100.7501 },
+                      { name: 'บางแสน ชลบุรี', lat: 13.2849, lon: 100.9152 },
+                    ].map((dest) => (
+                      <button
+                        key={dest.name}
+                        onClick={() => selectQuickDestination(dest)}
+                        style={{
+                          backgroundColor: '#f8fafc',
+                          border: '1px solid #e2e8f0',
+                          borderRadius: '16px',
+                          padding: '5px 10px',
+                          fontSize: '0.76rem',
+                          fontWeight: 600,
+                          color: '#334155',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                        }}
+                      >
+                        <Icon icon="solar:map-point-wave-bold" width="13" height="13" style={{ color: '#2563eb' }} />
+                        {dest.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => handleCheckRain(vehicleType, avoidTollways, avoidHighways)}
+                  disabled={loading || !destination}
+                  style={{
+                    backgroundColor: destination ? '#2563eb' : '#94a3b8',
+                    color: '#ffffff',
+                    border: 'none',
+                    borderRadius: '14px',
+                    padding: '12px',
+                    fontSize: '0.95rem',
+                    fontWeight: 800,
+                    cursor: destination ? 'pointer' : 'not-allowed',
+                    marginTop: '8px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <Icon icon="solar:radar-2-bold" width="20" height="20" />
+                  {destination ? 'สแกนสภาพอากาศเส้นทางนี้' : 'กรุณาเลือกปลายทางก่อน'}
+                </button>
+              </>
+            )}
+
+            {/* SHEET 2: TIME */}
+            {activeSheet === 'TIME' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Icon icon="solar:clock-circle-bold-duotone" width="24" height="24" style={{ color: '#2563eb' }} />
+                    <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 800, color: '#0f172a' }}>เวลาออกเดินทางล่วงหน้า</h3>
+                  </div>
+                  <button
+                    onClick={() => setActiveSheet('NONE')}
+                    style={{ border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#64748b' }}
+                  >
+                    <Icon icon="solar:close-circle-bold" width="20" height="20" />
+                  </button>
+                </div>
+
+                <div style={{ backgroundColor: '#eff6ff', padding: '12px', borderRadius: '14px', border: '1px solid #bfdbfe', textAlign: 'center' }}>
+                  <div style={{ fontSize: '0.78rem', color: '#64748b' }}>เวลาออกเดินทางเป้าหมาย</div>
+                  <div style={{ fontSize: '1.35rem', fontWeight: 900, color: '#1d4ed8', marginTop: '2px' }}>
+                    {getDepartureTimeLabel(departureOffsetMin)}
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
+                  {[
+                    { label: 'ตอนนี้', min: 0 },
+                    { label: '+30 นาที', min: 30 },
+                    { label: '+1 ชม.', min: 60 },
+                    { label: '+1.5 ชม.', min: 90 },
+                    { label: '+2 ชม.', min: 120 },
+                    { label: '+3 ชม.', min: 180 },
+                  ].map((preset) => (
+                    <button
+                      key={preset.min}
+                      onClick={() => {
+                        setDepartureOffsetMin(preset.min);
+                        if (data && destination) handleCheckRain(vehicleType, avoidTollways, avoidHighways);
+                      }}
+                      style={{
+                        padding: '8px 4px',
+                        borderRadius: '10px',
+                        border: departureOffsetMin === preset.min ? '2px solid #2563eb' : '1px solid #e2e8f0',
+                        backgroundColor: departureOffsetMin === preset.min ? '#eff6ff' : '#ffffff',
+                        color: departureOffsetMin === preset.min ? '#1d4ed8' : '#334155',
+                        fontWeight: 700,
+                        fontSize: '0.8rem',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div style={{ marginTop: '6px' }}>
+                  <input
+                    type="range"
+                    min={0}
+                    max={360}
+                    step={15}
+                    value={departureOffsetMin}
+                    onChange={(e) => setDepartureOffsetMin(parseInt(e.target.value, 10))}
+                    style={{ width: '100%', height: '6px', accentColor: '#2563eb', cursor: 'pointer' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem', color: '#64748b' }}>
+                    <span>ตอนนี้</span>
+                    <span>+6 ชม.</span>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => {
+                    if (destination) handleCheckRain(vehicleType, avoidTollways, avoidHighways);
+                    setActiveSheet('NONE');
+                  }}
+                  style={{ backgroundColor: '#2563eb', color: '#ffffff', border: 'none', borderRadius: '12px', padding: '10px', fontWeight: 800, cursor: 'pointer' }}
+                >
+                  อัปเดตเส้นทาง
+                </button>
+              </>
+            )}
+
+            {/* SHEET 3: AVOID */}
+            {activeSheet === 'AVOID' && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Icon icon="solar:tuning-bold-duotone" width="24" height="24" style={{ color: '#2563eb' }} />
+                    <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 800, color: '#0f172a' }}>การเลี่ยงเส้นทาง</h3>
+                  </div>
+                  <button
+                    onClick={() => setActiveSheet('NONE')}
+                    style={{ border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#64748b' }}
+                  >
+                    <Icon icon="solar:close-circle-bold" width="20" height="20" />
+                  </button>
+                </div>
+
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '12px 14px',
+                    borderRadius: '14px',
+                    backgroundColor: avoidTollways ? '#fef2f2' : '#f8fafc',
+                    border: `1.5px solid ${avoidTollways ? '#fca5a5' : '#e2e8f0'}`,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{ width: '36px', height: '36px', borderRadius: '50%', backgroundColor: avoidTollways ? '#fee2e2' : '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Icon icon="solar:shield-cross-bold-duotone" width="20" height="20" style={{ color: avoidTollways ? '#ef4444' : '#64748b' }} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '0.9rem', fontWeight: 800, color: avoidTollways ? '#b91c1c' : '#1e293b' }}>
+                        เลี่ยงทางด่วน / โทลล์เวย์
+                      </div>
+                      <div style={{ fontSize: '0.74rem', color: '#64748b' }}>
+                        {avoidTollways ? 'วิ่งเฉพาะทางราบ ไม่ขึ้นทางด่วน' : 'อนุญาตให้ขึ้นทางด่วนได้'}
+                      </div>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={avoidTollways}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setAvoidTollways(next);
+                      if (data && destination) handleCheckRain(vehicleType, next, avoidHighways);
+                    }}
+                    style={{ width: '18px', height: '18px', accentColor: '#ef4444' }}
+                  />
+                </label>
+
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '12px 14px',
+                    borderRadius: '14px',
+                    backgroundColor: avoidHighways ? '#fffbeb' : '#f8fafc',
+                    border: `1.5px solid ${avoidHighways ? '#fde68a' : '#e2e8f0'}`,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{ width: '36px', height: '36px', borderRadius: '50%', backgroundColor: avoidHighways ? '#fef3c7' : '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Icon icon="solar:signpost-bold-duotone" width="20" height="20" style={{ color: avoidHighways ? '#d97706' : '#64748b' }} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '0.9rem', fontWeight: 800, color: avoidHighways ? '#b45309' : '#1e293b' }}>
+                        เลี่ยงทางหลวง (Highways / มอเตอร์เวย์)
+                      </div>
+                      <div style={{ fontSize: '0.74rem', color: '#64748b' }}>
+                        {avoidHighways ? 'เลี่ยงถนนหลักความเร็วสูง' : 'วิ่งถนนทางหลวงได้ตามปกติ'}
+                      </div>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={avoidHighways}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setAvoidHighways(next);
+                      if (data && destination) handleCheckRain(vehicleType, avoidTollways, next);
+                    }}
+                    style={{ width: '18px', height: '18px', accentColor: '#f59e0b' }}
+                  />
+                </label>
+
+                <button
+                  onClick={() => {
+                    if (destination) handleCheckRain(vehicleType, avoidTollways, avoidHighways);
+                    setActiveSheet('NONE');
+                  }}
+                  style={{ backgroundColor: '#2563eb', color: '#ffffff', border: 'none', borderRadius: '12px', padding: '10px', fontWeight: 800, cursor: 'pointer' }}
+                >
+                  ตกลง
+                </button>
+              </>
+            )}
+
+            {/* SHEET 4: SUMMARY */}
+            {activeSheet === 'SUMMARY' && data && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Icon icon="solar:cloud-rain-bold-duotone" width="24" height="24" style={{ color: '#2563eb' }} />
+                    <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 800, color: '#0f172a' }}>รายงานสภาพอากาศเส้นทาง</h3>
+                  </div>
+                  <button
+                    onClick={() => setActiveSheet('NONE')}
+                    style={{ border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#64748b' }}
+                  >
+                    <Icon icon="solar:close-circle-bold" width="20" height="20" />
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    padding: '14px',
+                    borderRadius: '16px',
+                    backgroundColor: '#f8fafc',
+                    borderLeft: `6px solid ${getStatusColor(activeRoute ? activeRoute.status : data.summary.status)}`,
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '1.05rem', fontWeight: 900, color: getStatusColor(activeRoute ? activeRoute.status : data.summary.status) }}>
+                      {getStatusText(activeRoute ? activeRoute.status : data.summary.status)}
+                    </span>
+                    <span style={{ fontSize: '0.76rem', fontWeight: 800, color: '#334155', backgroundColor: '#e2e8f0', padding: '3px 8px', borderRadius: '10px' }}>
+                      ฝนสูงสุด {activeRoute ? activeRoute.maxRainProbability : data.summary.maxRainProbability}%
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+                    <div style={{ backgroundColor: 'white', padding: '8px 10px', borderRadius: '8px' }}>
+                      <div style={{ fontSize: '0.7rem', color: '#64748b' }}>ระยะทาง</div>
+                      <div style={{ fontSize: '1rem', fontWeight: 800 }}>{activeRoute ? activeRoute.distanceKm : data.summary.totalDistanceKm} กม.</div>
+                    </div>
+                    <div style={{ backgroundColor: 'white', padding: '8px 10px', borderRadius: '8px' }}>
+                      <div style={{ fontSize: '0.7rem', color: '#64748b' }}>เวลาเดินทาง</div>
+                      <div style={{ fontSize: '1rem', fontWeight: 800, color: '#2563eb' }}>
+                        {activeRoute?.durationFormatted || formatDuration(activeRoute ? activeRoute.durationMin : data.summary.totalDurationMin)}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: '0.8rem', color: activeRoute?.hasTollway ? '#b45309' : '#047857', fontWeight: 700 }}>
+                    {activeRoute?.hasTollway ? `🚗 ขึ้นทางด่วน (~ ${activeRoute.tollDistanceKm} กม.)` : '🚫 ทางราบล้วน ไม่ขึ้นทางด่วน'}
+                  </div>
+
+                  <div style={{ marginTop: '8px', fontSize: '0.82rem', color: '#334155', lineHeight: '1.4' }}>
+                    💡 <strong>คำแนะนำ:</strong> {activeRoute ? activeRoute.recommendation : data.summary.recommendation}
+                  </div>
+                </div>
+
+                <div style={{ fontSize: '0.84rem', fontWeight: 800, color: '#1e293b', marginTop: '6px' }}>
+                  จุดตรวจสภาพอากาศตลอดสาย ({activeRoute?.checkpoints?.length || data.checkpoints.length} จุด)
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '180px', overflowY: 'auto' }}>
+                  {(activeRoute?.checkpoints || data.checkpoints).map((pt) => (
+                    <div
+                      key={pt.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '6px 10px',
+                        borderRadius: '8px',
+                        backgroundColor: '#f8fafc',
+                        fontSize: '0.78rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: getStatusColor(pt.status) }} />
+                        <span>จุดที่ {pt.id} {pt.etaTime ? `(~ ${pt.etaTime} น.)` : ''}</span>
+                      </div>
+                      <span style={{ fontWeight: 700, color: getStatusColor(pt.status) }}>
+                        {pt.rainProbability > 0 ? `ฝน ${pt.rainProbability}%` : 'แห้ง'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* DRIVER HUD */}
+      {isTracking && (
+        <>
+          <div
+            style={{
+              position: 'absolute',
+              top: 'max(14px, env(safe-area-inset-top))',
+              left: '14px',
+              right: '14px',
+              zIndex: 1000,
+              backgroundColor: 'rgba(15, 23, 42, 0.92)',
+              backdropFilter: 'blur(16px)',
+              borderRadius: '24px',
+              padding: '10px 16px',
+              boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '10px',
+              color: '#ffffff',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
+              <span style={{ fontSize: '1.9rem', fontWeight: 900, color: '#38bdf8', lineHeight: 1 }}>
+                {liveLocation?.speed != null ? liveLocation.speed : '0'}
+              </span>
+              <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>กม./ชม.</span>
+            </div>
+
+            <div style={{ flex: 1, minWidth: 0, textAlign: 'center' }}>
+              <span
+                style={{
+                  backgroundColor: data ? getStatusColor(activeRoute ? activeRoute.status : data.summary.status) : '#2563eb',
+                  color: '#ffffff',
+                  padding: '3px 10px',
+                  borderRadius: '12px',
+                  fontSize: '0.78rem',
+                  fontWeight: 800,
+                }}
+              >
+                {data ? getStatusText(activeRoute ? activeRoute.status : data.summary.status) : 'กำลังนำทาง'}
+              </span>
+              <div style={{ fontSize: '0.74rem', color: '#cbd5e1', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {destinationName} {activeRoute ? `(${activeRoute.distanceKm} กม.)` : ''}
+              </div>
+            </div>
+
+            <button
+              onClick={toggleTracking}
+              style={{
+                backgroundColor: '#ef4444',
+                color: '#ffffff',
+                border: 'none',
+                borderRadius: '12px',
+                padding: '8px 12px',
+                fontSize: '0.8rem',
+                fontWeight: 800,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              <Icon icon="solar:stop-circle-bold-duotone" width="16" height="16" /> หยุด
+            </button>
+          </div>
+
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 'max(20px, env(safe-area-inset-bottom))',
+              left: '14px',
+              right: '14px',
+              zIndex: 1000,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '10px',
+              pointerEvents: 'none',
+            }}
+          >
+            {/* ปุ่มดึงกลับมาที่ตัวเรา (Re-center to POV) - แสดงเมื่ออยู่ในโหมด POV แต่ผู้ใช้เลื่อนแผนที่ออกไป */}
+            {(povMode === 'DRIVER_CLOSE' || povMode === 'DRIVER_FAR') && !autoFollow && (
               <button
                 onClick={() => {
-                  const nextMode = povMode === 'DRIVER' ? 'OVERVIEW' : 'DRIVER';
-                  setPovMode(nextMode);
                   setAutoFollow(true);
+                  setRecenterTrigger((c) => c + 1);
                 }}
                 style={{
                   pointerEvents: 'auto',
                   display: 'flex',
                   alignItems: 'center',
                   gap: '8px',
-                  backgroundColor: povMode === 'DRIVER' ? '#2563eb' : '#0f172a',
+                  backgroundColor: '#0284c7',
                   color: '#ffffff',
-                  border: '2px solid rgba(255,255,255,0.25)',
-                  borderRadius: '26px',
-                  padding: '12px 20px',
-                  fontSize: '0.92rem',
+                  border: '2px solid rgba(255, 255, 255, 0.4)',
+                  borderRadius: '24px',
+                  padding: '9px 18px',
+                  fontSize: '0.84rem',
                   fontWeight: 800,
                   cursor: 'pointer',
-                  boxShadow: '0 6px 22px rgba(0,0,0,0.35)',
-                  transition: 'all 0.2s ease',
+                  boxShadow: '0 6px 20px rgba(2, 132, 199, 0.45)',
+                  animation: 'pulse 1.5s infinite',
                 }}
               >
-                {povMode === 'DRIVER' ? (
-                  <>
-                    <span style={{ fontSize: '1.25rem' }}>🛵</span>
-                    <span>มุมมองคนขับ (ซูมใกล้)</span>
-                  </>
-                ) : (
-                  <>
-                    <span style={{ fontSize: '1.25rem' }}>🗺️</span>
-                    <span>ภาพรวมเส้นทาง</span>
-                  </>
+                <Icon icon="solar:target-bold" width="18" height="18" />
+                <span>ดึงกลับมาที่ตัวเรา (ติดตามต่อ)</span>
+              </button>
+            )}
+
+            {/* แถบเลือกโหมดมุมมอง (View Mode Selector) */}
+            <div
+              style={{
+                pointerEvents: 'auto',
+                display: 'inline-flex',
+                backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                backdropFilter: 'blur(16px)',
+                border: '1.5px solid rgba(255, 255, 255, 0.2)',
+                borderRadius: '30px',
+                padding: '4px',
+                boxShadow: '0 8px 30px rgba(0, 0, 0, 0.45)',
+                gap: '4px',
+              }}
+            >
+              {/* ตัวเลือกที่ 1: POV ใกล้ (18x) */}
+              <button
+                onClick={() => {
+                  setPovMode('DRIVER_CLOSE');
+                  setAutoFollow(true);
+                  setRecenterTrigger((c) => c + 1);
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '9px 15px',
+                  borderRadius: '24px',
+                  fontSize: '0.82rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  border: 'none',
+                  backgroundColor: povMode === 'DRIVER_CLOSE' ? '#2563eb' : 'transparent',
+                  color: povMode === 'DRIVER_CLOSE' ? '#ffffff' : '#94a3b8',
+                  boxShadow: povMode === 'DRIVER_CLOSE' ? '0 4px 16px rgba(37, 99, 235, 0.55)' : 'none',
+                  transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+                }}
+              >
+                <Icon
+                  icon={vehicleType === 'motorcycle' ? 'solar:scooter-bold-duotone' : 'solar:car-bold-duotone'}
+                  width="17"
+                  height="17"
+                />
+                <span>POV ใกล้</span>
+                {povMode === 'DRIVER_CLOSE' && autoFollow && (
+                  <span
+                    style={{
+                      width: '6px',
+                      height: '6px',
+                      borderRadius: '50%',
+                      backgroundColor: '#38bdf8',
+                      boxShadow: '0 0 6px #38bdf8',
+                    }}
+                  />
                 )}
               </button>
 
-              {/* ปุ่มล็อคกึ่งกลางรถ (Recenter) เมื่อผู้ใช้เอานิ้วเลื่อนแผนที่ไปดูที่อื่น */}
-              {!autoFollow && (
-                <button
-                  onClick={() => {
-                    setAutoFollow(true);
-                    setPovMode('DRIVER');
-                  }}
-                  style={{
-                    pointerEvents: 'auto',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    backgroundColor: '#10b981',
-                    color: '#ffffff',
-                    border: 'none',
-                    borderRadius: '26px',
-                    padding: '12px 18px',
-                    fontSize: '0.88rem',
-                    fontWeight: 800,
-                    cursor: 'pointer',
-                    boxShadow: '0 6px 20px rgba(16,185,129,0.4)',
-                  }}
-                >
-                  <span>🎯</span>
-                  <span>กึ่งกลางรถ</span>
-                </button>
-              )}
-            </div>
-          </>
-        )}
-
-        {/* ปุ่มลอย Quick Actions บนแผนที่ (แสดงเฉพาะเมื่อยังไม่ได้เริ่มนำทาง) */}
-        {!isTracking && (
-          <div
-            style={{
-              position: 'absolute',
-              bottom: isMobile ? (isDrawerCollapsed ? '96px' : '300px') : '24px',
-              right: '16px',
-              zIndex: 999,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '10px',
-              transition: 'bottom 0.3s ease',
-            }}
-          >
-            {/* ปุ่มเริ่มนำทางสด */}
-            <button
-              onClick={toggleTracking}
-              style={{
-                width: '48px',
-                height: '48px',
-                borderRadius: '50%',
-                backgroundColor: '#2563eb',
-                color: '#ffffff',
-                border: '2px solid #ffffff',
-                boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: '1.3rem',
-                transition: 'all 0.2s ease',
-              }}
-              title="เริ่มนำทางสด"
-            >
-              🧭
-            </button>
-
-            {/* ปุ่มดึง GPS ด่วนครั้งเดียว */}
-            <button
-              onClick={handleGetCurrentLocation}
-              disabled={isGpsLoading}
-              style={{
-                width: '48px',
-                height: '48px',
-                borderRadius: '50%',
-                backgroundColor: '#ffffff',
-                border: '1px solid #cbd5e1',
-                boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
-                cursor: isGpsLoading ? 'not-allowed' : 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: '1.25rem',
-              }}
-              title="ดึงพิกัดปัจจุบัน"
-            >
-              {isGpsLoading ? '⏳' : '📍'}
-            </button>
-
-            {/* ปุ่มสลับเปิด/ปิด Drawer สำหรับมือถือ */}
-            {isMobile && (
+              {/* ตัวเลือกที่ 2: วิวบน (ซูมไกล 14x) */}
               <button
-                onClick={() => setIsDrawerCollapsed(!isDrawerCollapsed)}
+                onClick={() => {
+                  setPovMode('DRIVER_FAR');
+                  setAutoFollow(true);
+                  setRecenterTrigger((c) => c + 1);
+                }}
                 style={{
-                  width: '48px',
-                  height: '48px',
-                  borderRadius: '50%',
-                  backgroundColor: '#0f172a',
-                  color: '#ffffff',
-                  border: 'none',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
-                  cursor: 'pointer',
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: '1.15rem',
+                  gap: '6px',
+                  padding: '9px 15px',
+                  borderRadius: '24px',
+                  fontSize: '0.82rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  border: 'none',
+                  backgroundColor: povMode === 'DRIVER_FAR' ? '#2563eb' : 'transparent',
+                  color: povMode === 'DRIVER_FAR' ? '#ffffff' : '#94a3b8',
+                  boxShadow: povMode === 'DRIVER_FAR' ? '0 4px 16px rgba(37, 99, 235, 0.55)' : 'none',
+                  transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
                 }}
-                title={isDrawerCollapsed ? 'เปิดแผงควบคุม' : 'ย่อแผงควบคุม'}
               >
-                {isDrawerCollapsed ? '🗺️' : '⬇️'}
+                <Icon icon="solar:satellite-bold-duotone" width="17" height="17" />
+                <span>วิวบน (ซูมไกล)</span>
+                {povMode === 'DRIVER_FAR' && autoFollow && (
+                  <span
+                    style={{
+                      width: '6px',
+                      height: '6px',
+                      borderRadius: '50%',
+                      backgroundColor: '#38bdf8',
+                      boxShadow: '0 0 6px #38bdf8',
+                    }}
+                  />
+                )}
               </button>
-            )}
+
+              {/* ตัวเลือกที่ 3: ภาพรวมเส้นทาง */}
+              <button
+                onClick={() => {
+                  setPovMode('OVERVIEW');
+                  setAutoFollow(false);
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '9px 15px',
+                  borderRadius: '24px',
+                  fontSize: '0.82rem',
+                  fontWeight: 800,
+                  cursor: 'pointer',
+                  border: 'none',
+                  backgroundColor: povMode === 'OVERVIEW' ? '#2563eb' : 'transparent',
+                  color: povMode === 'OVERVIEW' ? '#ffffff' : '#94a3b8',
+                  boxShadow: povMode === 'OVERVIEW' ? '0 4px 16px rgba(37, 99, 235, 0.55)' : 'none',
+                  transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+                }}
+              >
+                <Icon icon="solar:map-bold-duotone" width="17" height="17" />
+                <span>ภาพรวม</span>
+              </button>
+            </div>
           </div>
-        )}
-      </div>
+        </>
+      )}
+
+      {/* RADAR SCANNING ANIMATION OVERLAY */}
+      {loading && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 3000,
+            backgroundColor: 'rgba(15, 23, 42, 0.68)',
+            backdropFilter: 'blur(10px)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '24px',
+            color: '#ffffff',
+          }}
+        >
+          <div
+            style={{
+              position: 'relative',
+              width: '180px',
+              height: '180px',
+              borderRadius: '50%',
+              border: '2px solid rgba(56, 189, 248, 0.45)',
+              boxShadow: '0 0 35px rgba(14, 165, 233, 0.4), inset 0 0 35px rgba(14, 165, 233, 0.25)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              overflow: 'hidden',
+              background: 'radial-gradient(circle, rgba(14, 165, 233, 0.2) 0%, rgba(15, 23, 42, 0.85) 100%)',
+            }}
+          >
+            <div style={{ position: 'absolute', width: '120px', height: '120px', borderRadius: '50%', border: '1px dashed rgba(56, 189, 248, 0.4)' }} />
+            <div style={{ position: 'absolute', width: '60px', height: '60px', borderRadius: '50%', border: '1px solid rgba(56, 189, 248, 0.5)' }} />
+            <div style={{ position: 'absolute', width: '100%', height: '1px', background: 'rgba(56, 189, 248, 0.3)' }} />
+            <div style={{ position: 'absolute', height: '100%', width: '1px', background: 'rgba(56, 189, 248, 0.3)' }} />
+
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                borderRadius: '50%',
+                background: 'conic-gradient(from 0deg, rgba(56, 189, 248, 0) 0deg, rgba(56, 189, 248, 0) 260deg, rgba(56, 189, 248, 0.65) 360deg)',
+                animation: 'radarSpin 1.6s linear infinite',
+              }}
+            />
+
+            <div
+              style={{
+                position: 'relative',
+                width: '46px',
+                height: '46px',
+                borderRadius: '50%',
+                backgroundColor: '#0284c7',
+                boxShadow: '0 0 24px #38bdf8',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: '2px solid #ffffff',
+              }}
+            >
+              <Icon icon="solar:radar-2-bold" width="26" height="26" className="animate-spin text-white" />
+            </div>
+          </div>
+
+          <div style={{ marginTop: '24px', textAlign: 'center', maxWidth: '320px' }}>
+            <div style={{ fontSize: '1.15rem', fontWeight: 900, color: '#f8fafc', letterSpacing: '0.3px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+              <span style={{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#38bdf8' }} />
+              <span>กำลังสแกนสภาพอากาศเส้นทาง</span>
+            </div>
+            <div style={{ fontSize: '0.82rem', color: '#94a3b8', marginTop: '6px', lineHeight: 1.4 }}>
+              เชื่อมต่อเรดาร์ฝนและดาวเทียม GISTDA ตรวจสอบสภาพถนนตลอดแนว...
+            </div>
+
+            <div
+              style={{
+                marginTop: '16px',
+                width: '210px',
+                height: '5px',
+                backgroundColor: 'rgba(255, 255, 255, 0.15)',
+                borderRadius: '3px',
+                overflow: 'hidden',
+                margin: '16px auto 0 auto',
+              }}
+            >
+              <div
+                style={{
+                  height: '100%',
+                  background: 'linear-gradient(90deg, #38bdf8, #818cf8, #38bdf8)',
+                  backgroundSize: '200% 100%',
+                  animation: 'scanProgressAnim 1.6s ease-in-out infinite',
+                  borderRadius: '3px',
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
